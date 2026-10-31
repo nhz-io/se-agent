@@ -52,7 +52,9 @@ fn domain() -> String {
 }
 
 pub fn install(socket: &Path) -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    // Not canonicalized: under Homebrew this stays the stable /opt/homebrew/bin/se-agent symlink
+    // instead of a versioned Caskroom path that disappears on upgrade.
+    let exe = std::env::current_exe()?;
     if exe.components().any(|c| c.as_os_str() == "target") {
         bail!(
             "refusing to install a LaunchAgent pointing into a build directory ({}); install the binary first, e.g. `cargo install --path . --root ~/.local`",

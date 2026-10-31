@@ -25,7 +25,16 @@ Command Line Tools only.
 | Prompts | One at a time; the dialog names the key, caller and pid. |
 | Socket | `~/Library/Caches/se-agent/agent.sock` (0600, dir 0700); stale sockets are replaced, refuses to start if another agent is live. |
 
-## Build and install
+## Install
+
+```bash
+brew install --cask nhz-io/tap/se-agent
+```
+
+The cask links `se-agent` into `/opt/homebrew/bin` and (re)starts the LaunchAgent on install and upgrade.
+Keys in `~/.se-agent` are not touched by upgrades or `brew uninstall`.
+
+## Build from source
 
 ```bash
 cargo test
