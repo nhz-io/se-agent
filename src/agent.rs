@@ -273,14 +273,7 @@ async fn handle(
                 let approval = match window.take() {
                     Some(w) => Approval::Reused(w),
                     None => {
-                        // macOS prefixes "se-agent is trying to".
-                        let mut reason = format!("{}.", purpose.text);
-                        if let Some(d) = setting {
-                            reason += &format!(
-                                " Approving lets {program} use this key for {} without asking.",
-                                config::fmt(d)
-                            );
-                        }
+                        let reason = purpose::dialog(&purpose.text, &program, setting);
                         Approval::Fresh(se::Context::new(&reason)?)
                     }
                 };

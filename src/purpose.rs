@@ -8,6 +8,7 @@
 use crate::wire;
 use std::ffi::CStr;
 use std::path::Path;
+use std::time::Duration;
 
 /// Longest piece of untrusted text put into the dialog.
 const MAX_PART: usize = 60;
@@ -77,6 +78,29 @@ fn invisible(c: char) -> bool {
     matches!(c,
         '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
         | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// The dialog's reason text. macOS shows it as "se-agent is trying to <reason>." and adds the
+/// final period itself, so the text must not end with one.
+pub fn dialog(what: &str, program: &str, window: Option<Duration>) -> String {
+    let what = what.trim_end_matches('.');
+    match window {
+        Some(d) => format!(
+            "{what}. Approving lets {program} use this key for {} without asking",
+            spoken(d)
+        ),
+        None => what.to_string(),
+    }
+}
+
+/// `30 min`, `1 hour`, `90 s` (for reading, unlike config::fmt).
+fn spoken(d: Duration) -> String {
+    match d.as_secs() {
+        3600 => "1 hour".into(),
+        s if s > 0 && s.is_multiple_of(3600) => format!("{} hours", s / 3600),
+        s if s > 0 && s.is_multiple_of(60) => format!("{} min", s / 60),
+        s => format!("{s} s"),
+    }
 }
 
 /// Untrusted text for the dialog: no control or invisible characters, bounded length.
@@ -321,6 +345,30 @@ mod tests {
     fn put(out: &mut Vec<u8>, s: &[u8]) {
         out.extend_from_slice(&(s.len() as u32).to_be_bytes());
         out.extend_from_slice(s);
+    }
+
+    #[test]
+    fn dialog_text() {
+        let w = |s| Some(Duration::from_secs(s));
+        assert_eq!(
+            dialog(
+                "sign \"test\" data with key \"github\"",
+                "ssh-keygen",
+                w(1800)
+            ),
+            "sign \"test\" data with key \"github\". Approving lets ssh-keygen use this key for 30 min without asking"
+        );
+        assert_eq!(
+            dialog("log in to github.com", "ssh", None),
+            "log in to github.com"
+        );
+        assert!(!dialog("x", "ssh", w(90)).ends_with('.'));
+        assert_eq!(dialog("use key from Foo.", "ssh", None), "use key from Foo");
+        assert_eq!(spoken(Duration::ZERO), "0 s");
+        assert_eq!(spoken(Duration::from_secs(3600)), "1 hour");
+        assert_eq!(spoken(Duration::from_secs(7200)), "2 hours");
+        assert_eq!(spoken(Duration::from_secs(5400)), "90 min");
+        assert_eq!(spoken(Duration::from_secs(90)), "90 s");
     }
 
     #[test]
