@@ -1,146 +1,18 @@
-//! Approval reuse window (opt-in, per key).
+//! Approval reuse windows.
 //!
 //! After a fresh Touch ID / password approval, further signatures with the same key from the same
 //! caller (Signing ID, e.g. `com.apple.ssh-keygen`) reuse that approval without a prompt: the agent
-//! keeps the approved LAContext. The window is set per key in ~/.se-agent/config.json (max 30 min)
-//! and ends, whichever comes first:
+//! keeps the approved LAContext. How long is set per key and program in config.toml (config.rs).
+//! A window ends, whichever comes first:
 //! - at its deadline, counted from the approval and not extended by use,
 //! - when the Mac sleeps,
 //! - on `se-agent forget` (SIGUSR1 to the agent),
-//! - when the key's setting is removed or shortened below the time already used,
+//! - when its setting is removed or shortened below the time already used,
 //! - when a reused signature fails, or the agent exits.
 
-use crate::store;
-use anyhow::{Context as _, Result, bail};
-use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::time::Duration;
 use time::OffsetDateTime;
-
-pub const MAX: Duration = Duration::from_secs(30 * 60);
-/// What `se-agent reuse <label> on` sets.
-pub const DEFAULT: Duration = MAX;
-
-// --- settings ---------------------------------------------------------------------------------
-
-pub fn config_path() -> Result<PathBuf> {
-    Ok(store::home()?.join(".se-agent/config.json"))
-}
-
-/// Per-key windows from config.json (`{"reuse": {"<label>": <seconds>}}`). No file: none.
-/// Refuses a file that other users can write, and caps every value at MAX.
-pub fn load() -> Result<BTreeMap<String, Duration>> {
-    load_from(&config_path()?)
-}
-
-fn load_from(path: &Path) -> Result<BTreeMap<String, Duration>> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    if fs::metadata(path)?.permissions().mode() & 0o022 != 0 {
-        bail!(
-            "{} is writable by other users; chmod 600 it",
-            path.display()
-        );
-    }
-    let v: Value =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    let mut out = BTreeMap::new();
-    if let Some(m) = v.get("reuse").and_then(Value::as_object) {
-        for (label, secs) in m {
-            if let Some(s) = secs.as_u64().filter(|&s| s > 0) {
-                out.insert(label.clone(), Duration::from_secs(s).min(MAX));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Sets (Some) or removes (None) one key's window, keeping the rest of the file.
-pub fn set(label: &str, window: Option<Duration>) -> Result<()> {
-    set_at(&config_path()?, label, window)
-}
-
-fn set_at(path: &Path, label: &str, window: Option<Duration>) -> Result<()> {
-    store::validate_label(label)?;
-    let dir = path.parent().unwrap();
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    let mut v: Value = match fs::read_to_string(path) {
-        Ok(t) => serde_json::from_str(&t).with_context(|| format!("parse {}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    if !v.is_object() {
-        v = json!({});
-    }
-    if !v["reuse"].is_object() {
-        v["reuse"] = json!({});
-    }
-    let m = v["reuse"].as_object_mut().unwrap();
-    match window {
-        Some(d) => m.insert(label.into(), json!(d.as_secs())),
-        None => m.remove(label),
-    };
-    let tmp = path.with_extension("json.tmp");
-    let _ = fs::remove_file(&tmp);
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
-    f.write_all(format!("{}\n", serde_json::to_string_pretty(&v)?).as_bytes())?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-/// `off` / `0` → None; `on` → DEFAULT; `90s`, `15m` or plain seconds, at most MAX (30m).
-pub fn parse(s: &str) -> Result<Option<Duration>> {
-    let s = s.trim().to_ascii_lowercase();
-    match s.as_str() {
-        "off" | "0" => return Ok(None),
-        "on" => return Ok(Some(DEFAULT)),
-        _ => {}
-    }
-    let (num, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
-        Some((i, _)) => s.split_at(i),
-        None => (s.as_str(), "s"),
-    };
-    let n: u64 = num
-        .parse()
-        .with_context(|| format!("invalid duration {s:?}: use e.g. 90s, 15m, on, off"))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n.saturating_mul(60),
-        "h" => n.saturating_mul(3600),
-        _ => bail!("invalid duration {s:?}: use e.g. 90s, 15m, on, off"),
-    };
-    if secs == 0 {
-        return Ok(None);
-    }
-    if secs > MAX.as_secs() {
-        bail!("{s} is longer than the maximum, {}", fmt(MAX));
-    }
-    Ok(Some(Duration::from_secs(secs)))
-}
-
-pub fn fmt(d: Duration) -> String {
-    let s = d.as_secs();
-    if s.is_multiple_of(60) {
-        format!("{}m", s / 60)
-    } else {
-        format!("{s}s")
-    }
-}
 
 // --- clocks -----------------------------------------------------------------------------------
 
@@ -255,15 +127,12 @@ impl<C> Windows<C> {
     pub fn sweep(
         &mut self,
         now: &Stamp,
-        settings: &BTreeMap<String, Duration>,
+        setting: impl Fn(&Scope) -> Option<Duration>,
     ) -> Vec<(Scope, Window<C>, End)> {
         let over: Vec<(Scope, End)> = self
             .map
             .iter()
-            .filter_map(|(scope, w)| {
-                w.end(now, settings.get(&scope.0).copied())
-                    .map(|e| (scope.clone(), e))
-            })
+            .filter_map(|(scope, w)| w.end(now, setting(scope)).map(|e| (scope.clone(), e)))
             .collect();
         over.into_iter()
             .map(|(scope, e)| {
@@ -307,92 +176,33 @@ mod tests {
     }
 
     #[test]
-    fn durations() {
-        assert_eq!(parse("off").unwrap(), None);
-        assert_eq!(parse("0").unwrap(), None);
-        assert_eq!(parse("0m").unwrap(), None);
-        assert_eq!(parse("on").unwrap(), Some(MAX));
-        assert_eq!(parse("90").unwrap(), Some(Duration::from_secs(90)));
-        assert_eq!(parse("90s").unwrap(), Some(Duration::from_secs(90)));
-        assert_eq!(parse("15m").unwrap(), Some(Duration::from_secs(900)));
-        assert_eq!(parse("30m").unwrap(), Some(MAX));
-        assert!(parse("31m").is_err());
-        assert!(parse("1h").is_err());
-        assert!(parse("5x").is_err());
-        assert!(parse("m").is_err());
-        assert_eq!(fmt(Duration::from_secs(1800)), "30m");
-        assert_eq!(fmt(Duration::from_secs(90)), "90s");
-    }
-
-    #[test]
-    fn settings_file() {
-        let dir = std::env::temp_dir().join(format!("se-agent-reuse-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let path = dir.join("config.json");
-        assert!(load_from(&path).unwrap().is_empty());
-
-        set_at(&path, "github", Some(MAX)).unwrap();
-        set_at(&path, "nhz-io", Some(Duration::from_secs(90))).unwrap();
-        set_at(&path, "nhz-io", None).unwrap();
-        assert!(set_at(&path, "../x", Some(MAX)).is_err());
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let got = load_from(&path).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got["github"], MAX);
-
-        // A hand-edited value above MAX is capped; zero means off.
-        fs::write(&path, r#"{"reuse": {"github": 86400, "runpod": 0}}"#).unwrap();
-        let got = load_from(&path).unwrap();
-        assert_eq!(got.get("github"), Some(&MAX));
-        assert!(!got.contains_key("runpod"));
-
-        // A file other users can write is refused.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(load_from(&path).is_err());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn window_rules() {
-        let mut ws: Windows<()> = Windows::default();
-        let mut cfg = BTreeMap::new();
-        cfg.insert("github".to_string(), Duration::from_secs(60));
+        let secs = Duration::from_secs;
         let k = scope("github", "com.apple.ssh-keygen");
-        ws.insert(
-            k.clone(),
-            Window::new((), at(100, 0), Duration::from_secs(60)),
-        );
+        let mut ws: Windows<()> = Windows::default();
+        ws.insert(k.clone(), Window::new((), at(100, 0), secs(60)));
 
         // Live, and use does not extend it.
-        assert!(ws.sweep(&at(130, 0), &cfg).is_empty());
+        assert!(ws.sweep(&at(130, 0), |_| Some(secs(60))).is_empty());
         let w = ws.take(&k).unwrap();
         ws.insert(k.clone(), w);
-        // Other caller or key: no window.
+        // Other caller, key or re-created key: no window.
         assert!(ws.take(&scope("github", "com.apple.ssh")).is_none());
         assert!(ws.take(&scope("nhz-io", "com.apple.ssh-keygen")).is_none());
         let recreated = (k.0.clone(), k.1.clone(), "SHA256:y".to_string());
         assert!(ws.take(&recreated).is_none());
 
-        let ends = |now, cfg: &BTreeMap<String, Duration>| {
+        let ends = |now, setting: Option<Duration>| {
             let mut ws: Windows<()> = Windows::default();
-            ws.insert(
-                k.clone(),
-                Window::new((), at(100, 0), Duration::from_secs(60)),
-            );
-            ws.sweep(&now, cfg).pop().map(|(_, _, e)| e)
+            ws.insert(k.clone(), Window::new((), at(100, 0), secs(60)));
+            ws.sweep(&now, |_| setting).pop().map(|(_, _, e)| e)
         };
-        assert_eq!(ends(at(159, 0), &cfg), None);
-        assert_eq!(ends(at(160, 0), &cfg), Some(End::Expired));
-        assert_eq!(ends(at(110, 5), &cfg), Some(End::Sleep));
-        assert_eq!(ends(at(101, 0), &BTreeMap::new()), Some(End::Setting));
-        let mut shorter = BTreeMap::new();
-        shorter.insert("github".to_string(), Duration::from_secs(10));
-        assert_eq!(ends(at(120, 0), &shorter), Some(End::Expired));
-        let mut longer = BTreeMap::new();
-        longer.insert("github".to_string(), MAX);
-        assert_eq!(ends(at(160, 0), &longer), Some(End::Expired));
+        assert_eq!(ends(at(159, 0), Some(secs(60))), None);
+        assert_eq!(ends(at(160, 0), Some(secs(60))), Some(End::Expired));
+        assert_eq!(ends(at(110, 5), Some(secs(60))), Some(End::Sleep));
+        assert_eq!(ends(at(101, 0), None), Some(End::Setting));
+        // A shorter setting ends it early; a longer one does not stretch it.
+        assert_eq!(ends(at(120, 0), Some(secs(10))), Some(End::Expired));
+        assert_eq!(ends(at(160, 0), Some(secs(3600))), Some(End::Expired));
     }
 }

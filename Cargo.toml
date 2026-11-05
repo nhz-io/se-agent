@@ -1,6 +1,6 @@
 [package]
 name = "se-agent"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "macOS SSH agent with Secure Enclave keys (Touch ID, or the login password when Touch ID is unavailable)"
 license = "MIT"
@@ -13,6 +13,7 @@ libc = "0.2"
 serde_json = "1"
 signature = "2"
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ecdsa", "p256"] }
+toml = "1"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "signal", "sync", "time"] }
 

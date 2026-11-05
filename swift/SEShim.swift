@@ -87,6 +87,7 @@ public func se_public_key(
 public func se_context_new(reason: UnsafePointer<CChar>) -> UnsafeMutableRawPointer {
     let context = LAContext()
     context.localizedReason = String(cString: reason)
+    context.localizedCancelTitle = "Deny"
     return Unmanaged.passRetained(context).toOpaque()
 }
 

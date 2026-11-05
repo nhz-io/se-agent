@@ -4,8 +4,8 @@
 
 use crate::audit::AuditLog;
 use crate::peer::Peer;
-use crate::reuse::{self, End, Scope, Stamp, Window, Windows};
-use crate::{se, store, wire};
+use crate::reuse::{End, Scope, Stamp, Window, Windows};
+use crate::{config, purpose, se, store, wire};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::os::fd::AsRawFd;
@@ -58,9 +58,13 @@ impl State {
         );
     }
 
-    /// Closes every window that is over, given `settings` from `reuse::load`.
-    fn sweep(&self, settings: &std::collections::BTreeMap<String, Duration>) {
-        let over = self.windows.lock().unwrap().sweep(&Stamp::now(), settings);
+    /// Closes every window that is over, given the current settings.
+    fn sweep(&self, settings: &config::Settings) {
+        let over = self
+            .windows
+            .lock()
+            .unwrap()
+            .sweep(&Stamp::now(), |s| settings.get(&s.0, &s.1));
         for (scope, w, end) in over {
             self.close(&scope, w.until, end);
         }
@@ -83,8 +87,8 @@ impl State {
 }
 
 /// Reuse settings; an unreadable or unsafe file means no reuse at all.
-fn settings() -> std::collections::BTreeMap<String, Duration> {
-    reuse::load().unwrap_or_else(|e| {
+fn settings() -> config::Settings {
+    config::load(config::cap().max).unwrap_or_else(|e| {
         eprintln!("se-agent: reuse settings ignored: {e:#}");
         Default::default()
     })
@@ -245,21 +249,23 @@ async fn handle(
             else {
                 return Ok(vec![SSH_AGENT_FAILURE]);
             };
-            let caller = Path::new(&peer.path)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let program = config::program_name(&peer.signing_id).to_string();
+            let purpose = purpose::describe(&data, peer.pid, &key.label);
 
             let _guard = state.sign_lock.lock().await;
             let settings = settings();
             state.sweep(&settings);
-            let setting = settings.get(&key.label).copied();
+            let setting = settings.get(&key.label, &peer.signing_id);
             let scope: Scope = (
                 key.label.clone(),
                 peer.signing_id.clone(),
                 key.fingerprint(),
             );
-            let info = json!({ "key": key.label, "fingerprint": key.fingerprint() });
+            let info = json!({
+                "key": key.label,
+                "fingerprint": key.fingerprint(),
+                "purpose": purpose.text,
+            });
 
             // A live window first; if a reused approval fails, close it and prompt once.
             let mut window = state.windows.lock().unwrap().take(&scope);
@@ -267,14 +273,12 @@ async fn handle(
                 let approval = match window.take() {
                     Some(w) => Approval::Reused(w),
                     None => {
-                        let mut reason = format!(
-                            "use SSH key \"{}\" for {} (pid {})",
-                            key.label, caller, peer.pid
-                        );
+                        // macOS prefixes "se-agent is trying to".
+                        let mut reason = format!("{}.", purpose.text);
                         if let Some(d) = setting {
                             reason += &format!(
-                                ". No new prompt for this key and {caller} for {}",
-                                reuse::fmt(d)
+                                " Approving lets {program} use this key for {} without asking.",
+                                config::fmt(d)
                             );
                         }
                         Approval::Fresh(se::Context::new(&reason)?)

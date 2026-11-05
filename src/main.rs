@@ -1,7 +1,9 @@
 mod agent;
 mod audit;
+mod config;
 mod launchd;
 mod peer;
+mod purpose;
 mod reuse;
 mod se;
 mod store;
@@ -49,15 +51,11 @@ enum Cmd {
     Uninstall,
     /// Print the default socket path (for IdentityAgent / SSH_AUTH_SOCK).
     Socket,
-    /// Show or set a key's approval reuse window (off by default). After one approval, further
-    /// signatures with that key from the same program (e.g. ssh-keygen) don't prompt until it ends:
-    /// timeout (from the approval, not extended by use), sleep or `se-agent forget`.
-    Reuse {
-        /// Key label; without it, list all keys.
-        label: Option<String>,
-        /// `on` (30m), `off`, or a duration up to 30m, e.g. `90s`, `15m`.
-        window: Option<String>,
-    },
+    /// Show the approval reuse windows from ~/.config/se-agent/config.toml (off unless set) and
+    /// the cap. After one approval, further signatures with that key from the same program don't
+    /// prompt until the window ends: timeout (from the approval, not extended by use), sleep or
+    /// `se-agent forget`.
+    Reuse,
     /// End all reuse windows now: the next signature prompts again.
     Forget,
 }
@@ -130,28 +128,38 @@ fn main() -> Result<()> {
         }
         Cmd::Uninstall => launchd::uninstall()?,
         Cmd::Socket => println!("{}", agent::default_socket()?.display()),
-        Cmd::Reuse { label, window } => {
-            if let Some(w) = window {
-                let label = label.as_deref().expect("clap: window needs a label");
-                let w = reuse::parse(&w)?;
-                if w.is_some() {
-                    store::load(label)?;
-                }
-                reuse::set(label, w)?;
-                if w.is_none() && store::load(label).is_err() {
-                    // `off` for a deleted key just cleans the setting up.
-                    println!("{label}\toff");
-                    return Ok(());
+        Cmd::Reuse => {
+            let cap = config::cap();
+            println!("cap\t{} ({})", config::fmt(cap.max), cap.source);
+            println!("config\t{}", config::config_path()?.display());
+            let settings = config::load(cap.max)?;
+            let keys = store::list()?;
+            for k in &keys {
+                let w = settings.for_key(&k.label);
+                let w = if w.is_empty() {
+                    "off".to_string()
+                } else {
+                    w.iter()
+                        .map(|(p, d)| format!("{p} {}", config::fmt(*d)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!("{}\t{w}", k.label);
+            }
+            for l in settings.configured_keys() {
+                if !keys.iter().any(|k| &k.label == l) {
+                    println!("warning\t[keys.{l}]: no such key");
                 }
             }
-            let settings = reuse::load()?;
-            let labels = match label {
-                Some(l) => vec![store::load(&l)?.label],
-                None => store::list()?.into_iter().map(|k| k.label).collect(),
-            };
-            for l in labels {
-                let w = settings.get(&l).map_or("off".into(), |d| reuse::fmt(*d));
-                println!("{l}\t{w}");
+            for p in &settings.problems {
+                println!("warning\t{p}");
+            }
+            let old = store::home()?.join(".se-agent/config.json");
+            if old.exists() {
+                println!(
+                    "warning\t{} is from v0.2.0/0.2.1 and no longer read; move its settings to config.toml and delete it",
+                    old.display()
+                );
             }
         }
         Cmd::Forget => launchd::forget()?,
