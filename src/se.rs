@@ -1,8 +1,8 @@
 //! Safe wrappers over the Swift shim (swift/SEShim.swift).
 
 use anyhow::{Result, anyhow};
-use std::ffi::{CStr, CString, c_char};
-use std::ptr;
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::ptr::{self, NonNull};
 
 unsafe extern "C" {
     fn se_is_available() -> i32;
@@ -20,12 +20,14 @@ unsafe extern "C" {
         pub_len: *mut usize,
         err_out: *mut *mut c_char,
     ) -> i32;
+    fn se_context_new(reason: *const c_char) -> *mut c_void;
+    fn se_context_free(ctx: *mut c_void);
     fn se_sign(
         blob: *const u8,
         blob_len: usize,
         data: *const u8,
         data_len: usize,
-        reason: *const c_char,
+        ctx: *mut c_void,
         sig_out: *mut *mut u8,
         sig_len: *mut usize,
         err_out: *mut *mut c_char,
@@ -90,10 +92,34 @@ pub fn public_key(blob: &[u8]) -> Result<Vec<u8>> {
     Ok(public)
 }
 
-/// Signs the full message (SHA-256 is applied inside CryptoKit). Blocks on Touch ID / password.
-/// Returns the 64-byte raw r || s.
-pub fn sign(blob: &[u8], data: &[u8], reason: &str) -> Result<Vec<u8>> {
-    let reason = CString::new(reason.replace('\0', " "))?;
+/// An authentication context (LAContext). The first signature with it asks for Touch ID /
+/// password; later ones reuse that approval without a prompt for as long as it lives.
+/// Dropping it ends the approval.
+pub struct Context(NonNull<c_void>);
+
+// Signatures are serialized by the agent's sign lock, so a context is never used concurrently.
+unsafe impl Send for Context {}
+
+impl Context {
+    /// `reason` is shown in the Touch ID / password dialog.
+    pub fn new(reason: &str) -> Result<Context> {
+        let reason = CString::new(reason.replace('\0', " "))?;
+        let p = unsafe { se_context_new(reason.as_ptr()) };
+        NonNull::new(p)
+            .map(Context)
+            .ok_or_else(|| anyhow!("LAContext allocation failed"))
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        unsafe { se_context_free(self.0.as_ptr()) }
+    }
+}
+
+/// Signs the full message (SHA-256 is applied inside CryptoKit). Blocks on Touch ID / password
+/// unless `ctx` was already approved. Returns the 64-byte raw r || s.
+pub fn sign(blob: &[u8], data: &[u8], ctx: &Context) -> Result<Vec<u8>> {
     let (mut s, mut sl, mut e) = (ptr::null_mut(), 0, ptr::null_mut());
     let rc = unsafe {
         se_sign(
@@ -101,7 +127,7 @@ pub fn sign(blob: &[u8], data: &[u8], reason: &str) -> Result<Vec<u8>> {
             blob.len(),
             data.as_ptr(),
             data.len(),
-            reason.as_ptr(),
+            ctx.0.as_ptr(),
             &mut s,
             &mut sl,
             &mut e,

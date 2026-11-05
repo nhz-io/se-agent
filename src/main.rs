@@ -2,6 +2,7 @@ mod agent;
 mod audit;
 mod launchd;
 mod peer;
+mod reuse;
 mod se;
 mod store;
 mod wire;
@@ -48,17 +49,25 @@ enum Cmd {
     Uninstall,
     /// Print the default socket path (for IdentityAgent / SSH_AUTH_SOCK).
     Socket,
+    /// Show or set a key's approval reuse window (off by default). After one approval, further
+    /// signatures with that key from the same program (e.g. ssh-keygen) don't prompt until it ends:
+    /// timeout (from the approval, not extended by use), sleep or `se-agent forget`.
+    Reuse {
+        /// Key label; without it, list all keys.
+        label: Option<String>,
+        /// `on` (30m), `off`, or a duration up to 30m, e.g. `90s`, `15m`.
+        window: Option<String>,
+    },
+    /// End all reuse windows now: the next signature prompts again.
+    Forget,
 }
 
 fn self_test(key: &store::Key) -> Result<()> {
     use signature::Verifier;
     let msg = b"se-agent: creation self-test";
     eprintln!("Self-test: authenticate once (Touch ID or password)...");
-    let raw = se::sign(
-        &key.blob,
-        msg,
-        &format!("confirm new SSH key \"{}\"", key.label),
-    )?;
+    let ctx = se::Context::new(&format!("confirm new SSH key \"{}\"", key.label))?;
+    let raw = se::sign(&key.blob, msg, &ctx)?;
     let blob = wire::signature_blob(&raw)?;
     let mut r = wire::Reader(&blob);
     r.string()?;
@@ -121,6 +130,26 @@ fn main() -> Result<()> {
         }
         Cmd::Uninstall => launchd::uninstall()?,
         Cmd::Socket => println!("{}", agent::default_socket()?.display()),
+        Cmd::Reuse { label, window } => {
+            if let Some(w) = window {
+                let label = label.as_deref().expect("clap: window needs a label");
+                let w = reuse::parse(&w)?;
+                if w.is_some() {
+                    store::load(label)?;
+                }
+                reuse::set(label, w)?;
+            }
+            let settings = reuse::load()?;
+            let labels = match label {
+                Some(l) => vec![l],
+                None => store::list()?.into_iter().map(|k| k.label).collect(),
+            };
+            for l in labels {
+                let w = settings.get(&l).map_or("off".into(), |d| reuse::fmt(*d));
+                println!("{l}\t{w}");
+            }
+        }
+        Cmd::Forget => launchd::forget()?,
     }
     Ok(())
 }

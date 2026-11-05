@@ -39,10 +39,7 @@ impl AuditLog {
     }
 
     pub fn record(&self, event: &str, peer: &Peer, extra: Value) {
-        let now = OffsetDateTime::now_utc();
         let mut rec = json!({
-            "time": now.format(&Rfc3339).unwrap_or_default(),
-            "event": event,
             "pid": peer.pid,
             "caller": peer.path,
             "signing_id": peer.signing_id,
@@ -51,6 +48,19 @@ impl AuditLog {
         if let Some(e) = &peer.error {
             rec["peer_error"] = json!(e);
         }
+        if let (Value::Object(r), Value::Object(x)) = (&mut rec, extra) {
+            r.extend(x);
+        }
+        self.event(event, rec);
+    }
+
+    /// An event without a peer (e.g. a reuse window ending).
+    pub fn event(&self, event: &str, extra: Value) {
+        let now = OffsetDateTime::now_utc();
+        let mut rec = json!({
+            "time": now.format(&Rfc3339).unwrap_or_default(),
+            "event": event,
+        });
         if let (Value::Object(r), Value::Object(x)) = (&mut rec, extra) {
             r.extend(x);
         }

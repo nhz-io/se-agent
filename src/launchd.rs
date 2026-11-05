@@ -93,6 +93,18 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Asks the running agent to end all reuse windows (SIGUSR1 to the launchd service, not by name).
+pub fn forget() -> Result<()> {
+    let st = Command::new("launchctl")
+        .args(["kill", "SIGUSR1", &format!("{}/{LABEL}", domain())])
+        .status()?;
+    if !st.success() {
+        bail!("launchctl kill failed: is the agent running (se-agent install)?");
+    }
+    eprintln!("reuse windows ended; the next signature prompts again");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

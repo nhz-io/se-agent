@@ -4,6 +4,7 @@
 
 use crate::audit::AuditLog;
 use crate::peer::Peer;
+use crate::reuse::{self, End, Scope, Stamp, Window, Windows};
 use crate::{se, store, wire};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -12,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
@@ -24,6 +26,8 @@ const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 
 const MAX_MESSAGE: usize = 256 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// How often ended reuse windows are closed (and logged) without waiting for the next request.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn default_socket() -> Result<PathBuf> {
     Ok(store::home()?.join("Library/Caches/se-agent/agent.sock"))
@@ -33,6 +37,42 @@ struct State {
     log: AuditLog,
     /// One Touch ID / password prompt at a time.
     sign_lock: Mutex<()>,
+    /// Approved contexts per (key, caller); see reuse.rs.
+    windows: std::sync::Mutex<Windows<se::Context>>,
+}
+
+impl State {
+    fn close(&self, scope: &Scope, until: time::OffsetDateTime, end: End) {
+        self.log.event(
+            "window_close",
+            json!({
+                "key": scope.0,
+                "signing_id": scope.1,
+                "reason": end.as_str(),
+                "until": until.format(&Rfc3339).unwrap_or_default(),
+            }),
+        );
+    }
+
+    /// Closes every window that is over. Returns the current settings.
+    fn sweep(&self) -> std::collections::BTreeMap<String, Duration> {
+        let settings = reuse::load().unwrap_or_else(|e| {
+            eprintln!("se-agent: reuse settings ignored: {e:#}");
+            Default::default()
+        });
+        let over = self.windows.lock().unwrap().sweep(&Stamp::now(), &settings);
+        for (scope, w, end) in over {
+            self.close(&scope, w.until, end);
+        }
+        settings
+    }
+
+    fn forget(&self) {
+        let all = self.windows.lock().unwrap().drain();
+        for (scope, w) in all {
+            self.close(&scope, w.until, End::Forget);
+        }
+    }
 }
 
 pub async fn run(socket: &Path, log: AuditLog) -> Result<()> {
@@ -65,9 +105,14 @@ pub async fn run(socket: &Path, log: AuditLog) -> Result<()> {
     let state = Arc::new(State {
         log,
         sign_lock: Mutex::new(()),
+        windows: Default::default(),
     });
 
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    // `se-agent forget`
+    let mut usr1 = signal(SignalKind::user_defined1())?;
+    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
     let result = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -80,12 +125,37 @@ pub async fn run(socket: &Path, log: AuditLog) -> Result<()> {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
+            _ = usr1.recv() => state.forget(),
+            _ = sweep.tick() => { state.sweep(); }
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = term.recv() => break Ok(()),
         }
     };
+    state.forget();
     let _ = std::fs::remove_file(socket);
     result
+}
+
+/// How a signature gets approved: a live reuse window, or a new prompt.
+enum Approval {
+    Reused(Window<se::Context>),
+    Fresh(se::Context),
+}
+
+impl Approval {
+    fn ctx(&self) -> &se::Context {
+        match self {
+            Approval::Reused(w) => &w.ctx,
+            Approval::Fresh(c) => c,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Approval::Reused(_) => "reused",
+            Approval::Fresh(_) => "prompt",
+        }
+    }
 }
 
 async fn serve(mut stream: UnixStream, state: Arc<State>) -> Result<()> {
@@ -163,28 +233,70 @@ async fn handle(
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let reason = format!(
-                "use SSH key \"{}\" for {} (pid {})",
-                key.label, caller, peer.pid
-            );
 
             let _guard = state.sign_lock.lock().await;
-            let blob = key.blob.clone();
-            let result =
-                tokio::task::spawn_blocking(move || se::sign(&blob, &data, &reason)).await?;
+            let settings = state.sweep();
+            let setting = settings.get(&key.label).copied();
+            let scope: Scope = (key.label.clone(), peer.signing_id.clone());
             let info = json!({ "key": key.label, "fingerprint": key.fingerprint() });
-            match result.and_then(|raw| wire::signature_blob(&raw)) {
-                Ok(sig) => {
-                    state.log.record("sign", peer, info);
-                    let mut out = vec![SSH_AGENT_SIGN_RESPONSE];
-                    wire::put_string(&mut out, &sig);
-                    Ok(out)
-                }
-                Err(e) => {
-                    let mut info = info;
-                    info["error"] = json!(format!("{e:#}"));
-                    state.log.record("sign_failed", peer, info);
-                    Ok(vec![SSH_AGENT_FAILURE])
+
+            // A live window first; if a reused approval fails, close it and prompt once.
+            let mut window = state.windows.lock().unwrap().take(&scope);
+            loop {
+                let approval = match window.take() {
+                    Some(w) => Approval::Reused(w),
+                    None => {
+                        let mut reason = format!(
+                            "use SSH key \"{}\" for {} (pid {})",
+                            key.label, caller, peer.pid
+                        );
+                        if let Some(d) = setting {
+                            reason += &format!(
+                                ". No new prompt for this key and {caller} for {}",
+                                reuse::fmt(d)
+                            );
+                        }
+                        Approval::Fresh(se::Context::new(&reason)?)
+                    }
+                };
+                let blob = key.blob.clone();
+                let data = data.clone();
+                let (result, approval) = tokio::task::spawn_blocking(move || {
+                    let r = se::sign(&blob, &data, approval.ctx());
+                    (r, approval)
+                })
+                .await?;
+                let mut info = info.clone();
+                info["approval"] = json!(approval.kind());
+                match result.and_then(|raw| wire::signature_blob(&raw)) {
+                    Ok(sig) => {
+                        let kept = match approval {
+                            Approval::Reused(w) => Some(w),
+                            Approval::Fresh(ctx) => {
+                                setting.map(|d| Window::new(ctx, Stamp::now(), d))
+                            }
+                        };
+                        if let Some(w) = &kept {
+                            info["window_until"] =
+                                json!(w.until.format(&Rfc3339).unwrap_or_default());
+                        }
+                        state.log.record("sign", peer, info);
+                        if let Some(w) = kept {
+                            state.windows.lock().unwrap().insert(scope, w);
+                        }
+                        let mut out = vec![SSH_AGENT_SIGN_RESPONSE];
+                        wire::put_string(&mut out, &sig);
+                        return Ok(out);
+                    }
+                    Err(e) => {
+                        info["error"] = json!(format!("{e:#}"));
+                        state.log.record("sign_failed", peer, info);
+                        if let Approval::Reused(w) = approval {
+                            state.close(&scope, w.until, End::Failed);
+                            continue;
+                        }
+                        return Ok(vec![SSH_AGENT_FAILURE]);
+                    }
                 }
             }
         }

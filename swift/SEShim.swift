@@ -79,21 +79,39 @@ public func se_public_key(
     }
 }
 
+/// Creates an authentication context for `se_sign` and returns an owned (+1) handle.
+/// `reason` is shown in the Touch ID / password dialog. Once a signature with this context has
+/// been approved, further signatures with the same context do not prompt again, for as long as
+/// the context lives: the reuse window is enforced by the caller, which frees the handle.
+@_cdecl("se_context_new")
+public func se_context_new(reason: UnsafePointer<CChar>) -> UnsafeMutableRawPointer {
+    let context = LAContext()
+    context.localizedReason = String(cString: reason)
+    return Unmanaged.passRetained(context).toOpaque()
+}
+
+/// Invalidates and releases a handle from `se_context_new`. Measured on macOS 27: `invalidate()`
+/// alone does not stop an approved context from signing again, so releasing it is what counts.
+@_cdecl("se_context_free")
+public func se_context_free(ctx: UnsafeMutableRawPointer) {
+    let context = Unmanaged<LAContext>.fromOpaque(ctx).takeRetainedValue()
+    context.invalidate()
+}
+
 /// Signs `data` (the full message; CryptoKit hashes it with SHA-256, which is what
 /// ecdsa-sha2-nistp256 requires, so the caller must NOT pre-hash).
 /// Output is the 64-byte raw r || s (`rawRepresentation`), never DER.
-/// `reason` is shown in the Touch ID / password dialog.
+/// `ctx` comes from `se_context_new`; it prompts unless it was already approved.
 @_cdecl("se_sign")
 public func se_sign(
     blob: UnsafePointer<UInt8>, blob_len: Int,
     data: UnsafePointer<UInt8>, data_len: Int,
-    reason: UnsafePointer<CChar>,
+    ctx: UnsafeMutableRawPointer,
     sig_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>, sig_len: UnsafeMutablePointer<Int>,
     err_out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
 ) -> Int32 {
     do {
-        let context = LAContext()
-        context.localizedReason = String(cString: reason)
+        let context = Unmanaged<LAContext>.fromOpaque(ctx).takeUnretainedValue()
         let key = try SecureEnclave.P256.Signing.PrivateKey(
             dataRepresentation: Data(bytes: blob, count: blob_len),
             authenticationContext: context
