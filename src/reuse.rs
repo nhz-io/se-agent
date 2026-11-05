@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -34,13 +34,16 @@ pub fn config_path() -> Result<PathBuf> {
 /// Per-key windows from config.json (`{"reuse": {"<label>": <seconds>}}`). No file: none.
 /// Refuses a file that other users can write, and caps every value at MAX.
 pub fn load() -> Result<BTreeMap<String, Duration>> {
-    let path = config_path()?;
-    let text = match fs::read_to_string(&path) {
+    load_from(&config_path()?)
+}
+
+fn load_from(path: &Path) -> Result<BTreeMap<String, Duration>> {
+    let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    if fs::metadata(&path)?.permissions().mode() & 0o022 != 0 {
+    if fs::metadata(path)?.permissions().mode() & 0o022 != 0 {
         bail!(
             "{} is writable by other users; chmod 600 it",
             path.display()
@@ -61,12 +64,15 @@ pub fn load() -> Result<BTreeMap<String, Duration>> {
 
 /// Sets (Some) or removes (None) one key's window, keeping the rest of the file.
 pub fn set(label: &str, window: Option<Duration>) -> Result<()> {
+    set_at(&config_path()?, label, window)
+}
+
+fn set_at(path: &Path, label: &str, window: Option<Duration>) -> Result<()> {
     store::validate_label(label)?;
-    let path = config_path()?;
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    let mut v: Value = match fs::read_to_string(&path) {
+    let mut v: Value = match fs::read_to_string(path) {
         Ok(t) => serde_json::from_str(&t).with_context(|| format!("parse {}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
@@ -92,12 +98,12 @@ pub fn set(label: &str, window: Option<Duration>) -> Result<()> {
         .with_context(|| format!("create {}", tmp.display()))?;
     f.write_all(format!("{}\n", serde_json::to_string_pretty(&v)?).as_bytes())?;
     f.sync_all()?;
-    fs::rename(&tmp, &path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
-/// `off` / `0` → None; `on` → DEFAULT; `90s`, `15m`, `1h` or plain seconds, at most MAX.
+/// `off` / `0` → None; `on` → DEFAULT; `90s`, `15m` or plain seconds, at most MAX (30m).
 pub fn parse(s: &str) -> Result<Option<Duration>> {
     let s = s.trim().to_ascii_lowercase();
     match s.as_str() {
@@ -197,8 +203,9 @@ impl End {
     }
 }
 
-/// (key label, caller Signing ID)
-pub type Scope = (String, String);
+/// (key label, caller Signing ID, key fingerprint). The fingerprint keeps a key re-created under
+/// the same label from inheriting the old key's window.
+pub type Scope = (String, String, String);
 
 pub struct Window<C> {
     pub ctx: C,
@@ -296,7 +303,7 @@ mod tests {
     }
 
     fn scope(k: &str, c: &str) -> Scope {
-        (k.into(), c.into())
+        (k.into(), c.into(), "SHA256:x".into())
     }
 
     #[test]
@@ -318,6 +325,37 @@ mod tests {
     }
 
     #[test]
+    fn settings_file() {
+        let dir = std::env::temp_dir().join(format!("se-agent-reuse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        assert!(load_from(&path).unwrap().is_empty());
+
+        set_at(&path, "github", Some(MAX)).unwrap();
+        set_at(&path, "nhz-io", Some(Duration::from_secs(90))).unwrap();
+        set_at(&path, "nhz-io", None).unwrap();
+        assert!(set_at(&path, "../x", Some(MAX)).is_err());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let got = load_from(&path).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["github"], MAX);
+
+        // A hand-edited value above MAX is capped; zero means off.
+        fs::write(&path, r#"{"reuse": {"github": 86400, "runpod": 0}}"#).unwrap();
+        let got = load_from(&path).unwrap();
+        assert_eq!(got.get("github"), Some(&MAX));
+        assert!(!got.contains_key("runpod"));
+
+        // A file other users can write is refused.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(load_from(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn window_rules() {
         let mut ws: Windows<()> = Windows::default();
         let mut cfg = BTreeMap::new();
@@ -335,6 +373,8 @@ mod tests {
         // Other caller or key: no window.
         assert!(ws.take(&scope("github", "com.apple.ssh")).is_none());
         assert!(ws.take(&scope("nhz-io", "com.apple.ssh-keygen")).is_none());
+        let recreated = (k.0.clone(), k.1.clone(), "SHA256:y".to_string());
+        assert!(ws.take(&recreated).is_none());
 
         let ends = |now, cfg: &BTreeMap<String, Duration>| {
             let mut ws: Windows<()> = Windows::default();

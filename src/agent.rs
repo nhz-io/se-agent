@@ -254,7 +254,11 @@ async fn handle(
             let settings = settings();
             state.sweep(&settings);
             let setting = settings.get(&key.label).copied();
-            let scope: Scope = (key.label.clone(), peer.signing_id.clone());
+            let scope: Scope = (
+                key.label.clone(),
+                peer.signing_id.clone(),
+                key.fingerprint(),
+            );
             let info = json!({ "key": key.label, "fingerprint": key.fingerprint() });
 
             // A live window first; if a reused approval fails, close it and prompt once.
