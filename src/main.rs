@@ -138,10 +138,15 @@ fn main() -> Result<()> {
                     store::load(label)?;
                 }
                 reuse::set(label, w)?;
+                if w.is_none() && store::load(label).is_err() {
+                    // `off` for a deleted key just cleans the setting up.
+                    println!("{label}\toff");
+                    return Ok(());
+                }
             }
             let settings = reuse::load()?;
             let labels = match label {
-                Some(l) => vec![l],
+                Some(l) => vec![store::load(&l)?.label],
                 None => store::list()?.into_iter().map(|k| k.label).collect(),
             };
             for l in labels {

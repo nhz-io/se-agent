@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +40,9 @@ struct State {
     sign_lock: Mutex<()>,
     /// Approved contexts per (key, caller); see reuse.rs.
     windows: std::sync::Mutex<Windows<se::Context>>,
+    /// Bumped by `forget`. A signature that was in flight when it changed keeps no window,
+    /// since its window was out of the map while `forget` drained it.
+    forgets: AtomicU64,
 }
 
 impl State {
@@ -54,25 +58,36 @@ impl State {
         );
     }
 
-    /// Closes every window that is over. Returns the current settings.
-    fn sweep(&self) -> std::collections::BTreeMap<String, Duration> {
-        let settings = reuse::load().unwrap_or_else(|e| {
-            eprintln!("se-agent: reuse settings ignored: {e:#}");
-            Default::default()
-        });
-        let over = self.windows.lock().unwrap().sweep(&Stamp::now(), &settings);
+    /// Closes every window that is over, given `settings` from `reuse::load`.
+    fn sweep(&self, settings: &std::collections::BTreeMap<String, Duration>) {
+        let over = self.windows.lock().unwrap().sweep(&Stamp::now(), settings);
         for (scope, w, end) in over {
             self.close(&scope, w.until, end);
         }
-        settings
+    }
+
+    /// The periodic sweep: reads the settings only while a window is open.
+    fn tick(&self) {
+        if !self.windows.lock().unwrap().is_empty() {
+            self.sweep(&settings());
+        }
     }
 
     fn forget(&self) {
+        self.forgets.fetch_add(1, Ordering::SeqCst);
         let all = self.windows.lock().unwrap().drain();
         for (scope, w) in all {
             self.close(&scope, w.until, End::Forget);
         }
     }
+}
+
+/// Reuse settings; an unreadable or unsafe file means no reuse at all.
+fn settings() -> std::collections::BTreeMap<String, Duration> {
+    reuse::load().unwrap_or_else(|e| {
+        eprintln!("se-agent: reuse settings ignored: {e:#}");
+        Default::default()
+    })
 }
 
 pub async fn run(socket: &Path, log: AuditLog) -> Result<()> {
@@ -106,6 +121,7 @@ pub async fn run(socket: &Path, log: AuditLog) -> Result<()> {
         log,
         sign_lock: Mutex::new(()),
         windows: Default::default(),
+        forgets: AtomicU64::new(0),
     });
 
     use tokio::signal::unix::{SignalKind, signal};
@@ -126,7 +142,7 @@ pub async fn run(socket: &Path, log: AuditLog) -> Result<()> {
                 }
             },
             _ = usr1.recv() => state.forget(),
-            _ = sweep.tick() => { state.sweep(); }
+            _ = sweep.tick() => state.tick(),
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = term.recv() => break Ok(()),
         }
@@ -235,7 +251,8 @@ async fn handle(
                 .unwrap_or_default();
 
             let _guard = state.sign_lock.lock().await;
-            let settings = state.sweep();
+            let settings = settings();
+            state.sweep(&settings);
             let setting = settings.get(&key.label).copied();
             let scope: Scope = (key.label.clone(), peer.signing_id.clone());
             let info = json!({ "key": key.label, "fingerprint": key.fingerprint() });
@@ -259,13 +276,28 @@ async fn handle(
                         Approval::Fresh(se::Context::new(&reason)?)
                     }
                 };
+                let forgets = state.forgets.load(Ordering::SeqCst);
+                let reused_until = match &approval {
+                    Approval::Reused(w) => Some(w.until),
+                    Approval::Fresh(_) => None,
+                };
                 let blob = key.blob.clone();
                 let data = data.clone();
-                let (result, approval) = tokio::task::spawn_blocking(move || {
+                let joined = tokio::task::spawn_blocking(move || {
                     let r = se::sign(&blob, &data, approval.ctx());
                     (r, approval)
                 })
-                .await?;
+                .await;
+                let (result, approval) = match joined {
+                    Ok(x) => x,
+                    Err(e) => {
+                        // The context went down with the task: record that the window ended.
+                        if let Some(until) = reused_until {
+                            state.close(&scope, until, End::Failed);
+                        }
+                        return Err(e.into());
+                    }
+                };
                 let mut info = info.clone();
                 info["approval"] = json!(approval.kind());
                 match result.and_then(|raw| wire::signature_blob(&raw)) {
@@ -275,6 +307,14 @@ async fn handle(
                             Approval::Fresh(ctx) => {
                                 setting.map(|d| Window::new(ctx, Stamp::now(), d))
                             }
+                        };
+                        // `forget` ran meanwhile: end the window now instead of keeping it.
+                        let kept = match kept {
+                            Some(w) if state.forgets.load(Ordering::SeqCst) != forgets => {
+                                state.close(&scope, w.until, End::Forget);
+                                None
+                            }
+                            k => k,
                         };
                         if let Some(w) = &kept {
                             info["window_until"] =

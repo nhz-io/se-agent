@@ -61,7 +61,11 @@ pub fn load() -> Result<BTreeMap<String, Duration>> {
 
 /// Sets (Some) or removes (None) one key's window, keeping the rest of the file.
 pub fn set(label: &str, window: Option<Duration>) -> Result<()> {
+    store::validate_label(label)?;
     let path = config_path()?;
+    let dir = path.parent().unwrap();
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     let mut v: Value = match fs::read_to_string(&path) {
         Ok(t) => serde_json::from_str(&t).with_context(|| format!("parse {}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
@@ -269,6 +273,10 @@ impl<C> Windows<C> {
 
     pub fn insert(&mut self, scope: Scope, w: Window<C>) {
         self.map.insert(scope, w);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     pub fn drain(&mut self) -> Vec<(Scope, Window<C>)> {
