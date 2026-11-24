@@ -72,6 +72,35 @@ pub fn describe(data: &[u8], pid: i32, key: &str) -> Purpose {
     Purpose { text }
 }
 
+/// Describes an age decryption by `pid` (sops / age) with the key `recipient` (age1se1…).
+pub fn describe_age(pid: i32, recipient: &str) -> Purpose {
+    let chain = ancestry(pid);
+    let caller = chain.first();
+    let app = chain.iter().find_map(|p| app_name(&p.path));
+    let from = app
+        .map(|a| format!(" from {}", clean(&a)))
+        .unwrap_or_default();
+    let cmd = caller
+        .map(|c| {
+            let mut words = vec![c.name().to_string()];
+            words.extend(c.args.iter().skip(1).cloned());
+            words.join(" ")
+        })
+        .unwrap_or_else(|| "?".into());
+    let repo = caller
+        .and_then(|c| c.cwd.as_deref())
+        .and_then(repo_name)
+        .map(|r| format!(" in {}", clean(&r)))
+        .unwrap_or_default();
+    let key: String = recipient.chars().take(14).collect();
+    Purpose {
+        text: format!(
+            "decrypt for \"{}\"{repo}{from} with age key {key}…",
+            clean(&cmd)
+        ),
+    }
+}
+
 /// Characters that reorder, hide or break text: bidi marks, embeddings, overrides, isolates,
 /// line and paragraph separators, zero-width characters and the BOM.
 fn invisible(c: char) -> bool {
@@ -252,13 +281,13 @@ fn ancestry(pid: i32) -> Vec<Proc> {
     out
 }
 
-fn pid_path(pid: i32) -> Option<String> {
+pub fn pid_path(pid: i32) -> Option<String> {
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
     (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
-fn ppid(pid: i32) -> Option<i32> {
+pub fn ppid(pid: i32) -> Option<i32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
     let n =

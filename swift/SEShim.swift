@@ -170,3 +170,142 @@ public func se_peer_identity(
     outString(signingID, signing_id_out)
     return 0
 }
+
+// --- age (age-plugin-se identities) ----------------------------------------------------------
+//
+// Mirrors age-plugin-se v0.2.1 (github.com/remko/age-plugin-se, Sources/Plugin.swift, HPKE.swift)
+// byte for byte, with the same CryptoKit calls: stanza types `piv-p256` (age1se1 recipients) and
+// `p256tag` (age1tag1). The identity's key blob is a SecureEnclave.P256.KeyAgreement key
+// `dataRepresentation`; the ECDH runs in the Secure Enclave with the caller's LAContext.
+
+private let ageKindPIV: Int32 = 0
+private let ageKindTag: Int32 = 1
+
+/// Compressed (33-byte) public key of an age-plugin-se identity key blob. No prompt.
+@_cdecl("se_age_public")
+public func se_age_public(
+    blob: UnsafePointer<UInt8>, blob_len: Int,
+    pub_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>, pub_len: UnsafeMutablePointer<Int>,
+    err_out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32 {
+    do {
+        let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: Data(bytes: blob, count: blob_len))
+        out(key.publicKey.compressedRepresentation, pub_out, pub_len)
+        return 0
+    } catch {
+        return fail("\(error)", err_out)
+    }
+}
+
+/// Recipient.sha256Tag: SHA-256(compressed public key)[0..4].
+private func ageSHA256Tag(_ pub: Data) -> Data {
+    Data(SHA256.hash(data: pub).prefix(4))
+}
+
+/// Recipient.p256HKDFTag: HKDF-Extract(salt "age-encryption.org/p256tag", enc || sha256Tag)[0..4].
+private func ageP256Tag(_ pub: Data, _ enc: Data) -> Data {
+    Data(
+        HKDF<SHA256>.extract(
+            inputKeyMaterial: SymmetricKey(data: enc + ageSHA256Tag(pub)),
+            salt: Data("age-encryption.org/p256tag".utf8))
+    ).prefix(4)
+}
+
+/// The 4-byte stanza tag this identity (compressed public key `pub`) answers to. No prompt.
+@_cdecl("se_age_tag")
+public func se_age_tag(
+    pub: UnsafePointer<UInt8>, pub_len: Int, kind: Int32,
+    share: UnsafePointer<UInt8>, share_len: Int,
+    tag_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>, tag_len: UnsafeMutablePointer<Int>,
+    err_out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32 {
+    let pub = Data(bytes: pub, count: pub_len)
+    switch kind {
+    case ageKindPIV: out(ageSHA256Tag(pub), tag_out, tag_len)
+    case ageKindTag: out(ageP256Tag(pub, Data(bytes: share, count: share_len)), tag_out, tag_len)
+    default: return fail("unknown stanza kind \(kind)", err_out)
+    }
+    return 0
+}
+
+// HPKE (RFC 9180) pieces used by age-plugin-se for p256tag: DHKEM(P-256), HKDF-SHA256, ChaCha20Poly1305.
+private func hpkeSuiteID(kem: UInt16) -> Data {
+    Data("HPKE".utf8) + Data([UInt8(kem >> 8), UInt8(kem & 0xff), 0x00, 0x01, 0x00, 0x03])
+}
+
+private func hpkeLabeledExtract(_ suiteID: Data, salt: Data?, label: String, ikm: Data) -> Data {
+    let labeledIKM = Data("HPKE-v1".utf8) + suiteID + Data(label.utf8) + ikm
+    return Data(HKDF<SHA256>.extract(inputKeyMaterial: SymmetricKey(data: labeledIKM), salt: salt ?? Data()))
+}
+
+private func hpkeLabeledExpand(_ suiteID: Data, prk: Data, label: String, info: Data, length: Int) -> SymmetricKey {
+    let labeledInfo = Data([UInt8((length >> 8) & 0xff), UInt8(length & 0xff)])
+        + Data("HPKE-v1".utf8) + suiteID + Data(label.utf8) + info
+    return HKDF<SHA256>.expand(pseudoRandomKey: SymmetricKey(data: prk), info: labeledInfo, outputByteCount: length)
+}
+
+private func symmetricData(_ k: SymmetricKey) -> Data { k.withUnsafeBytes { Data($0) } }
+
+/// Unwraps one recipient stanza: `share` is the ephemeral public key (33 bytes compressed for
+/// piv-p256, 65 bytes uncompressed for p256tag), `body` the 32-byte sealed file key. Prompts
+/// unless `ctx` (from se_context_new) was already approved. Returns the 16-byte file key.
+@_cdecl("se_age_unwrap")
+public func se_age_unwrap(
+    blob: UnsafePointer<UInt8>, blob_len: Int, kind: Int32,
+    share: UnsafePointer<UInt8>, share_len: Int,
+    body: UnsafePointer<UInt8>, body_len: Int,
+    ctx: UnsafeMutableRawPointer,
+    key_out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>, key_len: UnsafeMutablePointer<Int>,
+    err_out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32 {
+    do {
+        let context = Unmanaged<LAContext>.fromOpaque(ctx).takeUnretainedValue()
+        let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(
+            dataRepresentation: Data(bytes: blob, count: blob_len),
+            authenticationContext: context
+        )
+        let shareData = Data(bytes: share, count: share_len)
+        let wrapKey: SymmetricKey
+        let nonce: ChaChaPoly.Nonce
+        switch kind {
+        case ageKindPIV:
+            let shareKey = try P256.KeyAgreement.PublicKey(compressedRepresentation: shareData)
+            let shared = try key.sharedSecretFromKeyAgreement(with: shareKey)
+            wrapKey = shared.hkdfDerivedSymmetricKey(
+                using: SHA256.self,
+                salt: shareData + key.publicKey.compressedRepresentation,
+                sharedInfo: Data("piv-p256".utf8),
+                outputByteCount: 32
+            )
+            nonce = try ChaChaPoly.Nonce(data: Data(count: 12))
+        case ageKindTag:
+            // HPKE.dhkemDecap
+            let shareKey = try P256.KeyAgreement.PublicKey(x963Representation: shareData)
+            let dh = try key.sharedSecretFromKeyAgreement(with: shareKey).withUnsafeBytes { Data($0) }
+            let kemSuite = Data("KEM".utf8) + Data([0x00, 0x10])
+            let eaePRK = hpkeLabeledExtract(kemSuite, salt: nil, label: "eae_prk", ikm: dh)
+            let sharedSecret = hpkeLabeledExpand(
+                kemSuite, prk: eaePRK, label: "shared_secret",
+                info: shareData + key.publicKey.x963Representation, length: 32)
+            // HPKE.context(kem: .dhkemP256, info: "age-encryption.org/p256tag")
+            let suite = hpkeSuiteID(kem: 0x0010)
+            let pskIDHash = hpkeLabeledExtract(suite, salt: nil, label: "psk_id_hash", ikm: Data())
+            let infoHash = hpkeLabeledExtract(
+                suite, salt: nil, label: "info_hash", ikm: Data("age-encryption.org/p256tag".utf8))
+            let ksContext = Data([0x00]) + pskIDHash + infoHash
+            let secret = hpkeLabeledExtract(suite, salt: symmetricData(sharedSecret), label: "secret", ikm: Data())
+            wrapKey = hpkeLabeledExpand(suite, prk: secret, label: "key", info: ksContext, length: 32)
+            nonce = try ChaChaPoly.Nonce(
+                data: symmetricData(hpkeLabeledExpand(suite, prk: secret, label: "base_nonce", info: ksContext, length: 12)))
+        default:
+            return fail("unknown stanza kind \(kind)", err_out)
+        }
+        let fileKey = try ChaChaPoly.open(
+            ChaChaPoly.SealedBox(combined: Data(nonce) + Data(bytes: body, count: body_len)),
+            using: wrapKey)
+        out(fileKey, key_out, key_len)
+        return 0
+    } catch {
+        return fail("\(error)", err_out)
+    }
+}

@@ -5,6 +5,10 @@ Every signature needs **Touch ID**, or the **Mac login password** when Touch ID 
 (lid closed, external keyboard without Touch ID). Rust plus a ~150-line Swift shim; builds with
 Command Line Tools only.
 
+It also decrypts for **sops / age** with an existing [age-plugin-se](https://github.com/remko/age-plugin-se)
+key, so one approval can cover a whole run of `sops -d` instead of one prompt per file (see
+[age-plugin-se drop-in](#age-plugin-se-drop-in)).
+
 ## Why
 
 - `sc_auth` / CTK keys are Touch ID-only (`-t bio`): no password fallback, so they fail with the lid closed.
@@ -21,7 +25,8 @@ Command Line Tools only.
 | Signature | CryptoKit hashes the message with SHA-256 (no pre-hash), returns `rawRepresentation` (exactly 64 bytes, anything else is an error), encoded as `string "ecdsa-sha2-nistp256", string(mpint r, mpint s)` with canonical mpints. |
 | Protocol | `REQUEST_IDENTITIES`, `SIGN_REQUEST`. Everything else (add/remove keys, lock, extensions incl. `session-bind@openssh.com`) → `SSH_AGENT_FAILURE`. |
 | Caller check | Audit token from `LOCAL_PEERTOKEN` → `SecCodeCopyGuestWithAttributes` (no PID-reuse race). Signing: valid signature + `anchor apple` + Signing ID `com.apple.ssh` / `scp` / `sftp` / `ssh-keygen`. Listing only: also `com.apple.ssh-add`. Everything else is refused (Homebrew `ssh` included). |
-| Audit log | `~/Library/Logs/se-agent.log` (0600), JSON lines: time, event (`sign` / `sign_failed` / `denied` / `window_close`), key, fingerprint, caller path, pid, signing id, `purpose`, `approval` (`prompt` or `reused`), `window_until`. |
+| age | Drop-in `age-plugin-se` (identity-v1) forwarding stanzas to the agent (`SSH_AGENTC_EXTENSION` `age-unwrap@se-agent.nhz.io`); ECDH in the Secure Enclave, wrap identical to age-plugin-se v0.2.1. See below. |
+| Audit log | `~/Library/Logs/se-agent.log` (0600), JSON lines: time, event (`sign` / `sign_failed` / `decrypt` / `decrypt_failed` / `denied` / `window_close`), key, fingerprint, caller path, pid, signing id, `purpose`, `approval` (`prompt` or `reused`), `window_until`. |
 | Prompts | One at a time; the dialog says what is being signed (see below). |
 | Reuse window | Opt-in per key and program, capped at 1 hour (see below). Keeps the approved `LAContext` in memory; no key material leaves the Secure Enclave. |
 | Socket | `~/Library/Caches/se-agent/agent.sock` (0600, dir 0700); stale sockets are replaced, refuses to start if another agent is live. |
@@ -130,6 +135,47 @@ and **Deny**. The audit log records the same text as `purpose`.
 Measured on macOS 27: `LAContext.invalidate()` alone does not stop an approved context from signing
 again, so se-agent ends a window by releasing the context. `touchIDAuthenticationAllowableReuseDuration`
 is not used: it only skips a prompt after a recent *device unlock* by Touch ID, and is capped at 5 minutes.
+
+### age-plugin-se drop-in
+
+`age-plugin-se` authenticates once per process, so sops asks for Touch ID / password for every file
+it opens. se-agent can stand in for it:
+
+```bash
+se-agent age-plugin install
+```
+
+links `~/.local/bin/age-plugin-se` → se-agent (`--dir` for another directory; it must come before
+`/opt/homebrew/bin` on PATH; `se-agent age-plugin status` shows what is found). Run under that name,
+se-agent speaks the age plugin protocol: for decryption (identity-v1) it sends the identities and
+recipient stanzas to the agent, which loads the same Secure Enclave key from the identity
+(`AGE-PLUGIN-SE-1…`, i.e. `~/.config/age/se-identity.txt`) and does the ECDH in the Secure Enclave
+with an `LAContext` it keeps. Both stanza types are handled (`piv-p256` for `age1se1…` recipients,
+`p256tag` for `age1tag1…`), with the same HKDF / HPKE / ChaCha20-Poly1305 steps as age-plugin-se
+v0.2.1. Same key, same identity file, same recipients: nothing is re-encrypted, and recovery never
+needs se-agent.
+
+Reuse is set under `[age]` in config.toml, per program, and applies per age key:
+
+```toml
+[age]
+reuse = { sops = "30m" }                    # programs: sops, age
+```
+
+Same rules as SSH windows (cap, sleep, `se-agent forget`, …). Every decryption is logged as
+`decrypt` with `approval` `prompt` or `reused`, the key (`age1se1…`), program, and `window_until`.
+
+**Caller.** The agent accepts the request only from its own binary (audit token, valid signature,
+same executable as the agent) whose parent process is `sops` or `age`. Homebrew's sops and age are
+ad-hoc signed (Signing ID `a.out`), so the parent is identified by its executable path, not a
+Signing ID: this scopes windows per program, it does not stop a process running as you, which could
+run sops itself while a window is open.
+
+**Fallback.** Everything else goes to the real `/opt/homebrew/bin/age-plugin-se`, unchanged:
+encryption (recipient-v1), `keygen` / `recipients`, the agent not running, a refused caller (it is
+replayed the request), and identities the agent cannot load (post-quantum ones). So with the agent
+down, sops still decrypts, one prompt per file as before. `se-agent age-plugin uninstall` removes
+the link.
 
 ### Wire into ssh
 

@@ -101,7 +101,7 @@ pub fn forget() -> Result<()> {
     if !st.success() {
         bail!("launchctl kill failed: is the agent running (se-agent install)?");
     }
-    eprintln!("reuse windows ended; the next signature prompts again");
+    eprintln!("reuse windows ended; the next signature or age decryption prompts again");
     Ok(())
 }
 

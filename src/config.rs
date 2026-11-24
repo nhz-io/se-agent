@@ -12,9 +12,12 @@
 //!
 //! [keys.nhz-io]
 //! reuse = { ssh-keygen = "30m", ssh = "5m" }
+//!
+//! [age]
+//! reuse = { sops = "30m" }                    # age-plugin-se keys (decryption, see age.rs)
 //! ```
 //!
-//! Programs: `ssh`, `ssh-keygen`, `scp`, `sftp`. Values: `"90s"`, `"15m"`, `"1h"` or seconds.
+//! Programs: `ssh`, `ssh-keygen`, `scp`, `sftp`; under `[age]`: `sops`, `age`. Values: `"90s"`, `"15m"`, `"1h"` or seconds.
 //! A key's `reuse` replaces `[defaults]` entirely. Every value must be at most the cap: 1 hour,
 //! unless root-owned `/etc/se-agent/max` says otherwise (higher or lower). An entry above the cap,
 //! or naming an unknown program, is skipped and reported. A file that other users can write, or
@@ -40,6 +43,9 @@ pub const PROGRAMS: [(&str, &str); 4] = [
     ("sftp", "com.apple.sftp"),
 ];
 
+/// Programs under `[age]`: the caller's executable name (they are not Apple-signed; see age.rs).
+pub const AGE_PROGRAMS: [(&str, &str); 2] = [("sops", "sops"), ("age", "age")];
+
 pub fn program_name(signing_id: &str) -> &str {
     PROGRAMS
         .iter()
@@ -47,8 +53,8 @@ pub fn program_name(signing_id: &str) -> &str {
         .map_or(signing_id, |(name, _)| name)
 }
 
-fn signing_id(program: &str) -> Option<&'static str> {
-    PROGRAMS
+fn signing_id(table: &[(&str, &'static str)], program: &str) -> Option<&'static str> {
+    table
         .iter()
         .find(|(name, _)| *name == program)
         .map(|(_, id)| *id)
@@ -151,13 +157,19 @@ type Programs = BTreeMap<String, Duration>;
 pub struct Settings {
     defaults: Programs,
     keys: BTreeMap<String, Programs>,
+    /// `[age]`: per program name, for every age-plugin-se key.
+    age: Programs,
     /// Skipped entries, for `se-agent reuse` and the agent's error log.
     pub problems: Vec<String>,
 }
 
 impl Settings {
     /// The window for this key and caller; None = always prompt.
+    /// Age keys are labelled `age:<recipient>` (age::SCOPE_PREFIX) and use `[age]`.
     pub fn get(&self, label: &str, signing_id: &str) -> Option<Duration> {
+        if label.starts_with(crate::age::SCOPE_PREFIX) {
+            return self.age.get(signing_id).copied();
+        }
         self.keys
             .get(label)
             .unwrap_or(&self.defaults)
@@ -171,6 +183,14 @@ impl Settings {
         PROGRAMS
             .iter()
             .filter_map(|(name, id)| m.get(*id).map(|d| (*name, *d)))
+            .collect()
+    }
+
+    /// Effective `[age]` windows, as (program, length).
+    pub fn for_age(&self) -> Vec<(&'static str, Duration)> {
+        AGE_PROGRAMS
+            .iter()
+            .filter_map(|(name, id)| self.age.get(*id).map(|d| (*name, *d)))
             .collect()
     }
 
@@ -204,12 +224,15 @@ fn parse(text: &str, cap: Duration) -> Result<Settings> {
     let doc: toml::Table = text.parse()?;
     let mut s = Settings::default();
     for key in doc.keys() {
-        if key != "defaults" && key != "keys" {
+        if key != "defaults" && key != "keys" && key != "age" {
             s.problems.push(format!("unknown section [{key}]"));
         }
     }
     if let Some(d) = doc.get("defaults") {
-        s.defaults = programs("defaults", d, cap, &mut s.problems)?;
+        s.defaults = programs("defaults", d, &PROGRAMS, cap, &mut s.problems)?;
+    }
+    if let Some(a) = doc.get("age") {
+        s.age = programs("age", a, &AGE_PROGRAMS, cap, &mut s.problems)?;
     }
     if let Some(keys) = doc.get("keys") {
         let keys = keys.as_table().context("[keys] must be a table")?;
@@ -218,7 +241,13 @@ fn parse(text: &str, cap: Duration) -> Result<Settings> {
                 s.problems.push(format!("[keys.{label}]: {e:#}"));
                 continue;
             }
-            let p = programs(&format!("keys.{label}"), section, cap, &mut s.problems)?;
+            let p = programs(
+                &format!("keys.{label}"),
+                section,
+                &PROGRAMS,
+                cap,
+                &mut s.problems,
+            )?;
             s.keys.insert(label.clone(), p);
         }
     }
@@ -229,6 +258,7 @@ fn parse(text: &str, cap: Duration) -> Result<Settings> {
 fn programs(
     name: &str,
     section: &toml::Value,
+    table: &[(&str, &'static str)],
     cap: Duration,
     problems: &mut Vec<String>,
 ) -> Result<Programs> {
@@ -248,9 +278,11 @@ fn programs(
         format!("[{name}] reuse must be a table, e.g. {{ ssh-keygen = \"30m\" }}")
     })?;
     for (program, v) in reuse {
-        let Some(id) = signing_id(program) else {
+        let Some(id) = signing_id(table, program) else {
+            let known: Vec<&str> = table.iter().map(|(n, _)| *n).collect();
             problems.push(format!(
-                "[{name}] reuse: unknown program {program:?} (ssh, ssh-keygen, scp, sftp)"
+                "[{name}] reuse: unknown program {program:?} ({})",
+                known.join(", ")
             ));
             continue;
         };
@@ -321,6 +353,9 @@ mod tests {
             reuse = { ssh-keygen = "2h", ssh = 600, telnet = "1m" }
 
             [keys.off]
+
+            [age]
+            reuse = { sops = "30m", ssh = "1m" }
             "#,
             BUILTIN_CAP,
         )
@@ -335,7 +370,16 @@ mod tests {
         // Above the cap and unknown programs are skipped and reported.
         assert_eq!(s.get("nhz-io", KG), None);
         assert_eq!(s.get("nhz-io", SSH), Some(Duration::from_secs(600)));
-        assert_eq!(s.problems.len(), 2, "{:?}", s.problems);
+        assert_eq!(s.problems.len(), 3, "{:?}", s.problems);
+        // [age] applies to age keys only, by program name; [defaults] does not reach them.
+        assert_eq!(
+            s.get("age:age1se1x", "sops"),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(s.get("age:age1se1x", "age"), None);
+        assert_eq!(s.get("age:age1se1x", SSH), None);
+        assert_eq!(s.get("github", "sops"), None);
+        assert_eq!(s.for_age(), vec![("sops", Duration::from_secs(1800))]);
         assert_eq!(
             s.for_key("github"),
             vec![("ssh-keygen", Duration::from_secs(1800))]

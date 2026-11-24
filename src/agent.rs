@@ -5,7 +5,7 @@
 use crate::audit::AuditLog;
 use crate::peer::Peer;
 use crate::reuse::{End, Scope, Stamp, Window, Windows};
-use crate::{config, purpose, se, store, wire};
+use crate::{age, config, purpose, se, store, wire};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::os::fd::AsRawFd;
@@ -218,6 +218,12 @@ async fn handle(
     let allowed = match kind {
         SSH_AGENTC_REQUEST_IDENTITIES => peer.may_list(),
         SSH_AGENTC_SIGN_REQUEST => peer.may_sign(),
+        age::SSH_AGENTC_EXTENSION => {
+            if r.string()? != age::EXTENSION.as_bytes() {
+                return Ok(vec![SSH_AGENT_FAILURE]);
+            }
+            return age_unwrap(&mut r, peer, state, denied_logged).await;
+        }
         _ => return Ok(vec![SSH_AGENT_FAILURE]),
     };
     if !allowed {
@@ -266,80 +272,240 @@ async fn handle(
                 "fingerprint": key.fingerprint(),
                 "purpose": purpose.text,
             });
-
-            // A live window first; if a reused approval fails, close it and prompt once.
-            let mut window = state.windows.lock().unwrap().take(&scope);
-            loop {
-                let approval = match window.take() {
-                    Some(w) => Approval::Reused(w),
-                    None => {
-                        let reason = purpose::dialog(&purpose.text, &program, setting);
-                        Approval::Fresh(se::Context::new(&reason)?)
-                    }
-                };
-                let forgets = state.forgets.load(Ordering::SeqCst);
-                let reused_until = match &approval {
-                    Approval::Reused(w) => Some(w.until),
-                    Approval::Fresh(_) => None,
-                };
-                let blob = key.blob.clone();
-                let data = data.clone();
-                let joined = tokio::task::spawn_blocking(move || {
-                    let r = se::sign(&blob, &data, approval.ctx());
-                    (r, approval)
-                })
-                .await;
-                let (result, approval) = match joined {
-                    Ok(x) => x,
-                    Err(e) => {
-                        // The context went down with the task: record that the window ended.
-                        if let Some(until) = reused_until {
-                            state.close(&scope, until, End::Failed);
-                        }
-                        return Err(e.into());
-                    }
-                };
-                let mut info = info.clone();
-                info["approval"] = json!(approval.kind());
-                match result.and_then(|raw| wire::signature_blob(&raw)) {
-                    Ok(sig) => {
-                        let kept = match approval {
-                            Approval::Reused(w) => Some(w),
-                            Approval::Fresh(ctx) => {
-                                setting.map(|d| Window::new(ctx, Stamp::now(), d))
-                            }
-                        };
-                        // `forget` ran meanwhile: end the window now instead of keeping it.
-                        let kept = match kept {
-                            Some(w) if state.forgets.load(Ordering::SeqCst) != forgets => {
-                                state.close(&scope, w.until, End::Forget);
-                                None
-                            }
-                            k => k,
-                        };
-                        if let Some(w) = &kept {
-                            info["window_until"] =
-                                json!(w.until.format(&Rfc3339).unwrap_or_default());
-                        }
-                        state.log.record("sign", peer, info);
-                        if let Some(w) = kept {
-                            state.windows.lock().unwrap().insert(scope, w);
-                        }
-                        let mut out = vec![SSH_AGENT_SIGN_RESPONSE];
-                        wire::put_string(&mut out, &sig);
-                        return Ok(out);
-                    }
-                    Err(e) => {
-                        info["error"] = json!(format!("{e:#}"));
-                        state.log.record("sign_failed", peer, info);
-                        if let Approval::Reused(w) = approval {
-                            state.close(&scope, w.until, End::Failed);
-                            continue;
-                        }
-                        return Ok(vec![SSH_AGENT_FAILURE]);
-                    }
+            let reason = purpose::dialog(&purpose.text, &program, setting);
+            let blob = key.blob.clone();
+            let op = move |ctx: &se::Context| {
+                se::sign(&blob, &data, ctx).and_then(|raw| wire::signature_blob(&raw))
+            };
+            match approved(state, peer, &scope, setting, &reason, "sign", info, op).await? {
+                Some(sig) => {
+                    let mut out = vec![SSH_AGENT_SIGN_RESPONSE];
+                    wire::put_string(&mut out, &sig);
+                    Ok(out)
                 }
+                None => Ok(vec![SSH_AGENT_FAILURE]),
             }
         }
     }
+}
+
+/// Runs `op` with an approval: the live window for `scope`, or a fresh context (a prompt with
+/// `reason`). A fresh approval opens a window if `setting` says so. Logs `event` (with `info`,
+/// `approval` and `window_until`) or `<event>_failed`. If a reused approval fails, the window is
+/// closed and it prompts once. None: failed (logged). The caller holds the sign lock and swept.
+#[allow(clippy::too_many_arguments)]
+async fn approved<T: Send + 'static>(
+    state: &State,
+    peer: &Peer,
+    scope: &Scope,
+    setting: Option<Duration>,
+    reason: &str,
+    event: &str,
+    info: serde_json::Value,
+    op: impl Fn(&se::Context) -> Result<T> + Send + Clone + 'static,
+) -> Result<Option<T>> {
+    let mut window = state.windows.lock().unwrap().take(scope);
+    loop {
+        let approval = match window.take() {
+            Some(w) => Approval::Reused(w),
+            None => Approval::Fresh(se::Context::new(reason)?),
+        };
+        let forgets = state.forgets.load(Ordering::SeqCst);
+        let reused_until = match &approval {
+            Approval::Reused(w) => Some(w.until),
+            Approval::Fresh(_) => None,
+        };
+        let op = op.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let r = op(approval.ctx());
+            (r, approval)
+        })
+        .await;
+        let (result, approval) = match joined {
+            Ok(x) => x,
+            Err(e) => {
+                // The context went down with the task: record that the window ended.
+                if let Some(until) = reused_until {
+                    state.close(scope, until, End::Failed);
+                }
+                return Err(e.into());
+            }
+        };
+        let mut info = info.clone();
+        info["approval"] = json!(approval.kind());
+        match result {
+            Ok(value) => {
+                let kept = match approval {
+                    Approval::Reused(w) => Some(w),
+                    Approval::Fresh(ctx) => setting.map(|d| Window::new(ctx, Stamp::now(), d)),
+                };
+                // `forget` ran meanwhile: end the window now instead of keeping it.
+                let kept = match kept {
+                    Some(w) if state.forgets.load(Ordering::SeqCst) != forgets => {
+                        state.close(scope, w.until, End::Forget);
+                        None
+                    }
+                    k => k,
+                };
+                if let Some(w) = &kept {
+                    info["window_until"] = json!(w.until.format(&Rfc3339).unwrap_or_default());
+                }
+                state.log.record(event, peer, info);
+                if let Some(w) = kept {
+                    state.windows.lock().unwrap().insert(scope.clone(), w);
+                }
+                return Ok(Some(value));
+            }
+            Err(e) => {
+                info["error"] = json!(format!("{e:#}"));
+                state.log.record(&format!("{event}_failed"), peer, info);
+                if let Approval::Reused(w) = approval {
+                    state.close(scope, w.until, End::Failed);
+                    continue;
+                }
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// The program that ran the drop-in age-plugin-se, if it may decrypt through the agent: the peer
+/// must be this very se-agent binary (checked from the audit token, like SSH callers), and its
+/// parent one of age::CALLERS. sops and age are ad-hoc signed (Signing ID `a.out`), so the parent
+/// is named by its executable path, read twice around the peer's parent PID: if the parent had
+/// exited in between, the peer would have been re-parented and the PID would differ.
+fn age_caller(peer: &Peer) -> std::result::Result<Peer, String> {
+    static SELF: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let me = SELF.get_or_init(|| std::env::current_exe().and_then(std::fs::canonicalize).ok());
+    if let Some(e) = &peer.error {
+        return Err(e.clone());
+    }
+    let peer_path = std::fs::canonicalize(&peer.path).ok();
+    if !peer.valid || me.is_none() || peer_path != *me {
+        return Err("not se-agent's age-plugin-se".into());
+    }
+    let parent = purpose::ppid(peer.pid).ok_or("no parent process")?;
+    let path = purpose::pid_path(parent).ok_or("parent has no path")?;
+    if purpose::ppid(peer.pid) != Some(parent) {
+        return Err("parent exited".into());
+    }
+    let name = path.rsplit('/').next().unwrap_or("");
+    if !age::CALLERS.contains(&name) {
+        return Err(format!(
+            "parent {path} is not one of {}",
+            age::CALLERS.join(", ")
+        ));
+    }
+    Ok(Peer {
+        pid: parent,
+        path: path.clone(),
+        signing_id: name.to_string(),
+        apple_platform: false,
+        valid: true,
+        error: None,
+    })
+}
+
+/// An age-unwrap request from the drop-in plugin. SSH_AGENT_FAILURE makes it run the real plugin.
+async fn age_unwrap(
+    r: &mut wire::Reader<'_>,
+    peer: &Peer,
+    state: &State,
+    denied_logged: &mut bool,
+) -> Result<Vec<u8>> {
+    let caller = match age_caller(peer) {
+        Ok(c) => c,
+        Err(why) => {
+            if !*denied_logged {
+                state
+                    .log
+                    .record("denied", peer, json!({ "request": "age", "reason": why }));
+                *denied_logged = true;
+            }
+            return Ok(vec![SSH_AGENT_FAILURE]);
+        }
+    };
+    let (ids, stanzas) = age::decode_request(r)?;
+    let identities = match ids
+        .iter()
+        .map(|s| age::Identity::parse(s))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("se-agent: age identity not usable here, real plugin takes over: {e:#}");
+            return Ok(vec![SSH_AGENT_FAILURE]);
+        }
+    };
+    let (mut responses, jobs) = age::plan(
+        &stanzas,
+        |i, kind, share| se::age_tag(&identities[i].public, kind, share),
+        identities.len(),
+    );
+    let mut msgs = Vec::new();
+    let program = caller.signing_id.clone();
+    for (idx, identity) in identities.iter().enumerate() {
+        let mine: Vec<(String, se::AgeKind, Vec<u8>, Vec<u8>)> = jobs
+            .iter()
+            .filter(|j| j.identity == idx && !responses.contains_key(&j.file))
+            .map(|j| (j.file.clone(), j.kind, j.share.clone(), j.body.clone()))
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let recipient = identity.recipient();
+        let purpose = purpose::describe_age(caller.pid, &recipient);
+
+        let _guard = state.sign_lock.lock().await;
+        let settings = settings();
+        state.sweep(&settings);
+        let label = format!("{}{recipient}", age::SCOPE_PREFIX);
+        let setting = settings.get(&label, &program);
+        let scope: Scope = (label, program.clone(), recipient.clone());
+        let info = json!({
+            "key": recipient,
+            "program": program,
+            "via": peer.path,
+            "stanzas": mine.len(),
+            "purpose": purpose.text,
+        });
+        let reason = purpose::dialog(&purpose.text, &program, setting);
+        let blob = identity.blob.clone();
+        // Succeeds if any stanza unwraps; the others become messages, as in age-plugin-se.
+        let op = move |ctx: &se::Context| {
+            let results: Vec<(String, Result<Vec<u8>>)> = mine
+                .iter()
+                .map(|(file, kind, share, body)| {
+                    (file.clone(), se::age_unwrap(&blob, *kind, share, body, ctx))
+                })
+                .collect();
+            if results.iter().any(|(_, r)| r.is_ok()) {
+                Ok(results)
+            } else {
+                let (_, first) = results.into_iter().next().unwrap();
+                Err(first.unwrap_err())
+            }
+        };
+        match approved(state, &caller, &scope, setting, &reason, "decrypt", info, op).await? {
+            Some(results) => {
+                for (file, res) in results {
+                    match res {
+                        Ok(key) => {
+                            responses
+                                .entry(file.clone())
+                                .or_insert_with(|| age::Stanza::new("file-key", &[&file], &key));
+                        }
+                        Err(e) => msgs.push(age::Stanza::new("msg", &[], format!("{e:#}").as_bytes())),
+                    }
+                }
+            }
+            None => msgs.push(age::Stanza::new(
+                "msg",
+                &[],
+                b"se-agent: decryption was not approved or failed (see ~/Library/Logs/se-agent.log)",
+            )),
+        }
+    }
+    msgs.extend(responses.into_values());
+    Ok(age::encode_response(&msgs))
 }

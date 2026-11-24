@@ -32,6 +32,36 @@ unsafe extern "C" {
         sig_len: *mut usize,
         err_out: *mut *mut c_char,
     ) -> i32;
+    fn se_age_public(
+        blob: *const u8,
+        blob_len: usize,
+        pub_out: *mut *mut u8,
+        pub_len: *mut usize,
+        err_out: *mut *mut c_char,
+    ) -> i32;
+    fn se_age_tag(
+        public: *const u8,
+        pub_len: usize,
+        kind: i32,
+        share: *const u8,
+        share_len: usize,
+        tag_out: *mut *mut u8,
+        tag_len: *mut usize,
+        err_out: *mut *mut c_char,
+    ) -> i32;
+    fn se_age_unwrap(
+        blob: *const u8,
+        blob_len: usize,
+        kind: i32,
+        share: *const u8,
+        share_len: usize,
+        body: *const u8,
+        body_len: usize,
+        ctx: *mut c_void,
+        key_out: *mut *mut u8,
+        key_len: *mut usize,
+        err_out: *mut *mut c_char,
+    ) -> i32;
     fn se_peer_identity(
         token: *const u8,
         token_len: usize,
@@ -48,6 +78,19 @@ unsafe fn take_bytes(p: *mut u8, len: usize) -> Vec<u8> {
         return Vec::new();
     }
     let v = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
+    unsafe { libc::free(p.cast()) };
+    v
+}
+
+/// Like take_bytes, for secrets: the shim's copy is zeroed before it is freed.
+unsafe fn take_secret(p: *mut u8, len: usize) -> Vec<u8> {
+    if p.is_null() {
+        return Vec::new();
+    }
+    let v = unsafe { std::slice::from_raw_parts(p, len) }.to_vec();
+    for i in 0..len {
+        unsafe { std::ptr::write_volatile(p.add(i), 0) };
+    }
     unsafe { libc::free(p.cast()) };
     v
 }
@@ -136,6 +179,74 @@ pub fn sign(blob: &[u8], data: &[u8], ctx: &Context) -> Result<Vec<u8>> {
     let sig = unsafe { take_bytes(s, sl) };
     check(rc, e)?;
     Ok(sig)
+}
+
+/// age-plugin-se stanza types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgeKind {
+    /// `piv-p256` (age1se1 recipients): share is a 33-byte compressed point.
+    Piv = 0,
+    /// `p256tag` (age1tag1 recipients): share is a 65-byte uncompressed point (HPKE enc).
+    Tag = 1,
+}
+
+/// Compressed public key of an age-plugin-se identity blob. No prompt.
+pub fn age_public(blob: &[u8]) -> Result<Vec<u8>> {
+    let (mut p, mut pl, mut e) = (ptr::null_mut(), 0, ptr::null_mut());
+    let rc = unsafe { se_age_public(blob.as_ptr(), blob.len(), &mut p, &mut pl, &mut e) };
+    let public = unsafe { take_bytes(p, pl) };
+    check(rc, e)?;
+    Ok(public)
+}
+
+/// The 4-byte tag a stanza must carry to be meant for `public` (compressed). No prompt.
+pub fn age_tag(public: &[u8], kind: AgeKind, share: &[u8]) -> Result<Vec<u8>> {
+    let (mut t, mut tl, mut e) = (ptr::null_mut(), 0, ptr::null_mut());
+    let rc = unsafe {
+        se_age_tag(
+            public.as_ptr(),
+            public.len(),
+            kind as i32,
+            share.as_ptr(),
+            share.len(),
+            &mut t,
+            &mut tl,
+            &mut e,
+        )
+    };
+    let tag = unsafe { take_bytes(t, tl) };
+    check(rc, e)?;
+    Ok(tag)
+}
+
+/// Unwraps a stanza's file key with the Secure Enclave (ECDH). Blocks on Touch ID / password
+/// unless `ctx` was already approved.
+pub fn age_unwrap(
+    blob: &[u8],
+    kind: AgeKind,
+    share: &[u8],
+    body: &[u8],
+    ctx: &Context,
+) -> Result<Vec<u8>> {
+    let (mut k, mut kl, mut e) = (ptr::null_mut(), 0, ptr::null_mut());
+    let rc = unsafe {
+        se_age_unwrap(
+            blob.as_ptr(),
+            blob.len(),
+            kind as i32,
+            share.as_ptr(),
+            share.len(),
+            body.as_ptr(),
+            body.len(),
+            ctx.0.as_ptr(),
+            &mut k,
+            &mut kl,
+            &mut e,
+        )
+    };
+    let key = unsafe { take_secret(k, kl) };
+    check(rc, e)?;
+    Ok(key)
 }
 
 pub struct PeerIdentity {
