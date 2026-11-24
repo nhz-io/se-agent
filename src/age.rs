@@ -560,6 +560,22 @@ fn ask(socket: &Path, identity: &str, stanzas: &[Stanza], command: &str) -> Opti
         .flatten()
 }
 
+/// The answer to use from the agents asked in order (lazily: later ones are asked only if needed):
+/// the first that decrypts something, else the first that answered at all (its messages, e.g. a
+/// denied approval), else None. An agent can answer without decrypting anything: this Mac's agent
+/// reads another Mac's identity but its Secure Enclave can't use the key, so the next one must get
+/// its turn.
+fn choose(replies: impl Iterator<Item = Option<Vec<Stanza>>>) -> Option<Vec<Stanza>> {
+    let mut first = None;
+    for reply in replies.flatten() {
+        if reply.iter().any(|s| s.kind == "file-key") {
+            return Some(reply);
+        }
+        first.get_or_insert(reply);
+    }
+    first
+}
+
 /// Entry point when run as `age-plugin-se`. Each identity goes to the first agent in `sockets`
 /// that takes it (this Mac's agent declines identities of another Mac's Secure Enclave, so those
 /// reach the upstream one). If an identity no agent takes leaves a file undecrypted, the whole
@@ -608,7 +624,8 @@ pub fn plugin_main(sockets: &[PathBuf]) -> ! {
         if open.is_empty() {
             break;
         }
-        let Some(reply) = sockets.iter().find_map(|s| ask(s, id, &open, &command)) else {
+        let replies = sockets.iter().map(|s| ask(s, id, &open, &command));
+        let Some(reply) = choose(replies) else {
             declined = true;
             continue;
         };
@@ -829,6 +846,24 @@ mod tests {
             plugin_sockets(local.clone(), Some(local.clone()), None, None, fwd),
             [local]
         );
+    }
+
+    #[test]
+    fn choosing() {
+        let key = || Some(vec![Stanza::new("file-key", &["0"], &[1])]);
+        let msg = || Some(vec![Stanza::new("msg", &[], b"failed")]);
+        // Local agent answers but decrypts nothing (another Mac's key): the upstream one counts.
+        assert_eq!(choose([msg(), key()].into_iter()), key());
+        // Local agent declines: upstream.
+        assert_eq!(choose([None, key()].into_iter()), key());
+        // Nobody decrypts: the first answer's messages.
+        assert_eq!(choose([msg(), Some(vec![])].into_iter()), msg());
+        assert_eq!(choose([None, None].into_iter()), None);
+        // Lazy: a decrypting first agent means the second is never asked.
+        let mut asked = 0;
+        let it = [key(), key()].into_iter().inspect(|_| asked += 1);
+        assert_eq!(choose(it), key());
+        assert_eq!(asked, 1);
     }
 
     #[test]

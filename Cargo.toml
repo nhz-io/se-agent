@@ -1,6 +1,6 @@
 [package]
 name = "se-agent"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "macOS SSH agent with Secure Enclave keys (Touch ID, or the login password when Touch ID is unavailable), and age-plugin-se decryption with approval reuse"
 license = "MIT"
