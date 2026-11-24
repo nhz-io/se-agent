@@ -362,7 +362,9 @@ fn get_stanzas(r: &mut wire::Reader) -> Result<Vec<Stanza>> {
     (0..n).map(|_| get_stanza(r)).collect()
 }
 
-pub fn encode_request(identities: &[String], stanzas: &[Stanza]) -> Vec<u8> {
+/// `command` (optional, after the stanzas): the plugin's caller, e.g. `sops decrypt x.yaml`. The
+/// agent shows it only for relayed requests (it reads local callers itself); older agents ignore it.
+pub fn encode_request(identities: &[String], stanzas: &[Stanza], command: &str) -> Vec<u8> {
     let mut out = vec![SSH_AGENTC_EXTENSION];
     wire::put_string(&mut out, EXTENSION.as_bytes());
     wire::put_u32(&mut out, identities.len() as u32);
@@ -373,11 +375,18 @@ pub fn encode_request(identities: &[String], stanzas: &[Stanza]) -> Vec<u8> {
     for s in stanzas {
         put_stanza(&mut out, s);
     }
+    wire::put_string(&mut out, command.as_bytes());
     out
 }
 
-/// The request after the extension name: (identities, recipient stanzas).
-pub fn decode_request(r: &mut wire::Reader) -> Result<(Vec<String>, Vec<Stanza>)> {
+pub struct Request {
+    pub identities: Vec<String>,
+    pub stanzas: Vec<Stanza>,
+    pub command: Option<String>,
+}
+
+/// The request after the extension name.
+pub fn decode_request(r: &mut wire::Reader) -> Result<Request> {
     let n = r.u32()? as usize;
     if n > 64 {
         bail!("too many identities");
@@ -385,7 +394,16 @@ pub fn decode_request(r: &mut wire::Reader) -> Result<(Vec<String>, Vec<Stanza>)
     let ids = (0..n)
         .map(|_| Ok(String::from_utf8(r.string()?.to_vec())?))
         .collect::<Result<Vec<_>>>()?;
-    Ok((ids, get_stanzas(r)?))
+    let stanzas = get_stanzas(r)?;
+    let command = match r.0.is_empty() {
+        true => None,
+        false => Some(String::from_utf8_lossy(r.string()?).into_owned()),
+    };
+    Ok(Request {
+        identities: ids,
+        stanzas,
+        command,
+    })
 }
 
 pub fn encode_response(stanzas: &[Stanza]) -> Vec<u8> {
@@ -492,16 +510,72 @@ fn agent_request(msg: &[u8], stream: &mut std::os::unix::net::UnixStream) -> Res
     Ok(reply)
 }
 
-/// Entry point when run as `age-plugin-se`.
-pub fn plugin_main(socket: &Path) -> ! {
+/// The agents the drop-in asks, in order: this Mac's agent, then an upstream one (another Mac's
+/// agent reached over ssh): `$SE_AGENT_UPSTREAM`, else `[upstream] socket` in config.toml, else
+/// `$SSH_AUTH_SOCK` if `forwarded` says it is an ssh login's forwarded agent. Duplicates dropped.
+pub fn plugin_sockets(
+    local: PathBuf,
+    env_upstream: Option<PathBuf>,
+    config_upstream: Option<PathBuf>,
+    ssh_auth_sock: Option<PathBuf>,
+    forwarded: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let upstream = env_upstream
+        .filter(|p| !p.as_os_str().is_empty())
+        .or(config_upstream)
+        .or_else(|| ssh_auth_sock.filter(|p| forwarded(p)));
+    let mut out = vec![local];
+    if let Some(u) = upstream
+        && !out
+            .iter()
+            .any(|p| canonical(p).is_some() && canonical(p) == canonical(&u))
+        && !out.contains(&u)
+    {
+        out.push(u);
+    }
+    out
+}
+
+/// The command line of the plugin's caller (sops / age), for the agent's dialog.
+fn caller_command() -> String {
+    let ppid = unsafe { libc::getppid() };
+    crate::purpose::pid_args(ppid)
+        .map(|a| {
+            let mut words = a;
+            if let Some(first) = words.first_mut() {
+                *first = first.rsplit('/').next().unwrap_or(first).to_string();
+            }
+            words.join(" ")
+        })
+        .unwrap_or_default()
+}
+
+/// One identity's answer from one agent: None if it declined (or is not there).
+fn ask(socket: &Path, identity: &str, stanzas: &[Stanza], command: &str) -> Option<Vec<Stanza>> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    let msg = encode_request(&[identity.to_string()], stanzas, command);
+    agent_request(&msg, &mut stream)
+        .and_then(|r| decode_response(&r))
+        .ok()
+        .flatten()
+}
+
+/// Entry point when run as `age-plugin-se`. Each identity goes to the first agent in `sockets`
+/// that takes it (this Mac's agent declines identities of another Mac's Secure Enclave, so those
+/// reach the upstream one). If an identity no agent takes leaves a file undecrypted, the whole
+/// request goes to the real plugin, as before.
+pub fn plugin_main(sockets: &[PathBuf]) -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if state_machine(&args) != Some("identity-v1") {
         exec_real(&args);
     }
-    // Agent first: if it isn't there, the real plugin gets an untouched stdin.
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+    // An agent first: if none is there, the real plugin gets an untouched stdin.
+    if !sockets
+        .iter()
+        .any(|s| std::os::unix::net::UnixStream::connect(s).is_ok())
+    {
         exec_real(&args);
-    };
+    }
 
     let mut stdin = BufReader::new(std::io::stdin());
     let mut raw = Vec::new();
@@ -520,13 +594,46 @@ pub fn plugin_main(socket: &Path) -> ! {
         }
     }
 
-    let reply = agent_request(&encode_request(&identities, &stanzas), &mut stream)
-        .and_then(|r| decode_response(&r));
-    drop(stream);
-    let responses = match reply {
-        Ok(Some(r)) => r,
-        Ok(None) | Err(_) => replay_real(&args, &raw, stdin),
-    };
+    let command = caller_command();
+    // Per file: its file-key or error. Messages go out as they are.
+    let mut done: BTreeMap<String, Stanza> = BTreeMap::new();
+    let mut msgs = Vec::new();
+    let mut declined = false;
+    for id in &identities {
+        let open: Vec<Stanza> = stanzas
+            .iter()
+            .filter(|s| s.args.first().is_some_and(|f| !done.contains_key(f)))
+            .cloned()
+            .collect();
+        if open.is_empty() {
+            break;
+        }
+        let Some(reply) = sockets.iter().find_map(|s| ask(s, id, &open, &command)) else {
+            declined = true;
+            continue;
+        };
+        for r in reply {
+            let file = match r.kind.as_str() {
+                "file-key" => r.args.first().cloned(),
+                "error" if r.args.first().map(String::as_str) == Some("stanza") => {
+                    r.args.get(1).cloned()
+                }
+                _ => None,
+            };
+            match file {
+                Some(f) => {
+                    done.entry(f).or_insert(r);
+                }
+                None => msgs.push(r),
+            }
+        }
+    }
+    let files: std::collections::BTreeSet<&String> =
+        stanzas.iter().filter_map(|s| s.args.first()).collect();
+    if declined && files.iter().any(|f| !done.contains_key(*f)) {
+        replay_real(&args, &raw, stdin);
+    }
+    let responses: Vec<Stanza> = msgs.into_iter().chain(done.into_values()).collect();
 
     let mut stdout = std::io::stdout().lock();
     let mut ignored = Vec::new();
@@ -607,11 +714,21 @@ mod tests {
             Stanza::new("recipient-stanza", &["1", "X25519", "zz"], &[]),
         ];
         let ids = vec!["AGE-PLUGIN-SE-1X".to_string()];
-        let req = encode_request(&ids, &st);
+        let req = encode_request(&ids, &st, "sops decrypt x.yaml");
         let mut r = wire::Reader(&req);
         assert_eq!(r.u8().unwrap(), SSH_AGENTC_EXTENSION);
         assert_eq!(r.string().unwrap(), EXTENSION.as_bytes());
-        assert_eq!(decode_request(&mut r).unwrap(), (ids, st.clone()));
+        let d = decode_request(&mut r).unwrap();
+        assert_eq!((&d.identities, &d.stanzas), (&ids, &st));
+        assert_eq!(d.command.as_deref(), Some("sops decrypt x.yaml"));
+        // v0.3.0's request had no command.
+        let mut old = vec![SSH_AGENTC_EXTENSION];
+        wire::put_string(&mut old, EXTENSION.as_bytes());
+        wire::put_u32(&mut old, 0);
+        wire::put_u32(&mut old, 0);
+        let mut r = wire::Reader(&old[1..]);
+        r.string().unwrap();
+        assert_eq!(decode_request(&mut r).unwrap().command, None);
         assert_eq!(decode_response(&encode_response(&st)).unwrap(), Some(st));
         assert_eq!(decode_response(&[5]).unwrap(), None);
     }
@@ -666,6 +783,51 @@ mod tests {
         assert_eq!(
             got,
             vec![("0", 0, se::AgeKind::Piv), ("1", 0, se::AgeKind::Tag)]
+        );
+    }
+
+    #[test]
+    fn sockets() {
+        let p = |s: &str| PathBuf::from(s);
+        let local = p("/l/agent.sock");
+        let fwd = |x: &Path| x.starts_with("/fwd");
+        // Nothing upstream: only this Mac's agent.
+        assert_eq!(
+            plugin_sockets(local.clone(), None, None, None, fwd),
+            std::slice::from_ref(&local)
+        );
+        // $SSH_AUTH_SOCK only if it is a forwarded agent (not, say, this Mac's own).
+        assert_eq!(
+            plugin_sockets(local.clone(), None, None, Some(p("/fwd/s")), fwd),
+            [local.clone(), p("/fwd/s")]
+        );
+        assert_eq!(
+            plugin_sockets(local.clone(), None, None, Some(p("/other/s")), fwd),
+            std::slice::from_ref(&local)
+        );
+        // config.toml beats $SSH_AUTH_SOCK, the environment beats both; empty env is unset.
+        assert_eq!(
+            plugin_sockets(local.clone(), None, Some(p("/cfg")), Some(p("/fwd/s")), fwd),
+            [local.clone(), p("/cfg")]
+        );
+        assert_eq!(
+            plugin_sockets(
+                local.clone(),
+                Some(p("/env")),
+                Some(p("/cfg")),
+                Some(p("/fwd/s")),
+                fwd
+            ),
+            [local.clone(), p("/env")]
+        );
+        assert_eq!(
+            plugin_sockets(local.clone(), Some(p("")), Some(p("/cfg")), None, fwd),
+            [local.clone(), p("/cfg")]
+        );
+        // The local socket named as upstream is not asked twice.
+        assert_eq!(
+            plugin_sockets(local.clone(), Some(local.clone()), None, None, fwd),
+            [local]
         );
     }
 

@@ -9,6 +9,10 @@ It also decrypts for **sops / age** with an existing [age-plugin-se](https://git
 key, so one approval can cover a whole run of `sops -d` instead of one prompt per file (see
 [age-plugin-se drop-in](#age-plugin-se-drop-in)).
 
+A headless Mac can **use another Mac's keys over ssh** (agent forwarding): signing works as with any
+forwarded agent, and age decryption can be allowed per host; every use still needs approval on the
+Mac that holds the key (see [Delegation](#delegation-another-mac-uses-these-keys-over-ssh)).
+
 ## Why
 
 - `sc_auth` / CTK keys are Touch ID-only (`-t bio`): no password fallback, so they fail with the lid closed.
@@ -23,13 +27,13 @@ key, so one approval can cover a whole run of `sops -d` instead of one prompt pe
 | Key | `SecureEnclave.P256.Signing.PrivateKey`, access control `[.privateKeyUsage, .userPresence]`, `WhenUnlockedThisDeviceOnly` |
 | Storage | CryptoKit `dataRepresentation` (Secure Enclave-wrapped, useless on another Mac) in `~/.se-agent/keys/<label>` (0600, dir 0700); public key in `<label>.pub`. No keychain, so no entitlements needed. |
 | Signature | CryptoKit hashes the message with SHA-256 (no pre-hash), returns `rawRepresentation` (exactly 64 bytes, anything else is an error), encoded as `string "ecdsa-sha2-nistp256", string(mpint r, mpint s)` with canonical mpints. |
-| Protocol | `REQUEST_IDENTITIES`, `SIGN_REQUEST`. Everything else (add/remove keys, lock, extensions incl. `session-bind@openssh.com`) → `SSH_AGENT_FAILURE`. |
-| Caller check | Audit token from `LOCAL_PEERTOKEN` → `SecCodeCopyGuestWithAttributes` (no PID-reuse race). Signing: valid signature + `anchor apple` + Signing ID `com.apple.ssh` / `scp` / `sftp` / `ssh-keygen`. Listing only: also `com.apple.ssh-add`. Everything else is refused (Homebrew `ssh` included). |
+| Protocol | `REQUEST_IDENTITIES`, `SIGN_REQUEST`, the `age-unwrap@se-agent.nhz.io` extension. `session-bind@openssh.com` is read (to recognise relayed requests and their destination) and, like everything else (add/remove keys, lock, other extensions), answered `SSH_AGENT_FAILURE`. |
+| Caller check | Audit token from `LOCAL_PEERTOKEN` → `SecCodeCopyGuestWithAttributes` (no PID-reuse race). Signing: valid signature + `anchor apple` + Signing ID `com.apple.ssh` / `scp` / `sftp` / `ssh-keygen`. Listing only: also `com.apple.ssh-add`. Everything else is refused (Homebrew `ssh` included). Requests Apple's `ssh` relays from another Mac are labelled with that host and have their own rules (see Delegation). |
 | age | Drop-in `age-plugin-se` (identity-v1) forwarding stanzas to the agent (`SSH_AGENTC_EXTENSION` `age-unwrap@se-agent.nhz.io`); ECDH in the Secure Enclave, wrap identical to age-plugin-se v0.2.1. See below. |
-| Audit log | `~/Library/Logs/se-agent.log` (0600), JSON lines: time, event (`sign` / `sign_failed` / `decrypt` / `decrypt_failed` / `denied` / `window_close`), key, fingerprint, caller path, pid, signing id, `purpose`, `approval` (`prompt` or `reused`), `window_until`. |
+| Audit log | `~/Library/Logs/se-agent.log` (0600), JSON lines: time, event (`sign` / `sign_failed` / `decrypt` / `decrypt_failed` / `sign_upstream` / `sign_upstream_failed` / `denied` / `window_close`), key, fingerprint, caller path, pid, signing id, `purpose`, `approval` (`prompt` or `reused`), `window_until`, and for relayed requests `relay` (host, its names, `via`, `destination`, `hops`). |
 | Prompts | One at a time; the dialog says what is being signed (see below). |
 | Reuse window | Opt-in per key and program, capped at 1 hour (see below). Keeps the approved `LAContext` in memory; no key material leaves the Secure Enclave. |
-| Socket | `~/Library/Caches/se-agent/agent.sock` (0600, dir 0700); stale sockets are replaced, refuses to start if another agent is live. |
+| Socket | `~/Library/Caches/se-agent/agent.sock` (0600, dir 0700), and `relay.sock` next to it for a persistent ssh `RemoteForward`; stale sockets are replaced, refuses to start if another agent is live. No TCP. |
 
 ## Install
 
@@ -177,6 +181,71 @@ replayed the request), and identities the agent cannot load (post-quantum ones).
 down, sops still decrypts, one prompt per file as before. `se-agent age-plugin uninstall` removes
 the link.
 
+### Delegation: another Mac uses these keys over ssh
+
+A headless Mac (here **box**) can't show its own approval dialog to anyone. Over ssh it can use
+the keys of the Mac you sit at (here **desk**) instead, through ssh's unix-socket forwarding; every
+use is approved on desk (Touch ID / password, or a reuse window started there). No TCP listener.
+
+**Transport**, either:
+
+- **While logged in**: in desk's `~/.ssh/config`, `Host box` → `ForwardAgent ~/Library/Caches/se-agent/agent.sock`.
+  On box `$SSH_AUTH_SOCK` is then desk's agent. (Through an existing ControlMaster connection
+  agent forwarding may not be set up; a fresh connection, `-o ControlPath=none`, is.)
+- **Persistent**: desk holds `ssh -N -R <path on box>:<desk's relay.sock> box` (e.g. as a
+  LaunchAgent); `se-agent socket --relay` prints the relay socket. Point it at `relay.sock`, not
+  `agent.sock`: ssh sends no session-bind for a `RemoteForward`, and only `relay.sock` marks those
+  connections as relayed. On `relay.sock` only Apple's `ssh` is served.
+
+**How relayed requests are told apart.** For a forwarded agent, desk's `ssh` opens one connection
+per channel and first sends `session-bind@openssh.com` with box's host key and
+`is_forwarding` set; everything on `relay.sock` is relayed. The host is named from desk's side:
+ssh's destination (`ssh box`; a ControlMaster's rewritten argv is skipped) and the names of the
+bound host key in desk's `known_hosts`. Where box logs in to comes from box's own
+session-bind (a hint, matched in `known_hosts`), so a forwarded GitHub login reads
+`log in to github.com as git for box (forwarded over ssh from WezTerm) with key "github"`, and
+the log has `"relay": {"host": "box", "via": "forward-agent", "destination": "github.com", ...}`.
+
+**Signing** through a forwarded agent works without configuration (as before). Relayed requests get
+**their own reuse windows**, never desk's local ones (before 0.4.0 a forwarded login could reuse
+desk's `ssh` window). In desk's `config.toml`:
+
+```toml
+[relay.box]                              # any of the host's names: box, box.local, …
+age = true                                   # allow age decryption from box (default: no)
+reuse = { ssh-keygen = "30m", age = "15m" }  # optional windows for relayed requests
+```
+
+Programs under `[relay.<host>]` are what kind of request it is, since box's processes aren't
+visible from desk: `ssh` (logins), `ssh-keygen` (SSHSIG signatures, e.g. git commits), `age`.
+Same cap and endings as other windows; scoped per key and host.
+
+**age decryption** through the relay is refused (and logged as `denied`, with the setting to
+change) unless `[relay.<host>] age = true`. The dialog names the host and what box's drop-in
+plugin reports as its caller: `decrypt for "sops decrypt x.yaml" on box (forwarded over ssh)
+with age key age1se1…` (the command is box's word for it; the host is desk's).
+
+**On box**, the drop-in `age-plugin-se` (`se-agent age-plugin install`) asks, per identity,
+first box's own agent, then an **upstream** agent: `$SE_AGENT_UPSTREAM`, else `[upstream]
+socket` in box's `config.toml`, else `$SSH_AUTH_SOCK` if its server is Apple's sshd (a forwarded
+agent). box's agent declines identities of desk's Secure Enclave, so those go upstream. Use a
+copy of desk's identity file (`AGE-PLUGIN-SE-1…`, only desk's Secure Enclave can use it), e.g.
+`age -d -i desk-se-identity.txt`, and add desk's `age1se1…` as a recipient where needed.
+
+```toml
+[upstream]                                   # box's config.toml
+socket = "~/.ssh/agent-desk.sock"           # the RemoteForward path (or leave it to $SSH_AUTH_SOCK)
+```
+
+With `[upstream] socket` set, **box's agent** also lists the upstream keys after its own and
+passes signatures with keys it doesn't hold to that socket (logged on box as `sign_upstream`,
+approved on desk), replaying the connection's session-binds so desk sees the destination. So
+`IdentityAgent ~/Library/Caches/se-agent/agent.sock` on box covers both Macs' keys. Requests that
+arrive relayed are never passed further upstream. Not done: falling back to upstream for box's
+own keys when nobody can approve at box's screen.
+
+`se-agent reuse` shows `relay <host>` lines and the upstream socket.
+
 ### Wire into ssh
 
 ```
@@ -208,5 +277,8 @@ tail -f ~/Library/Logs/se-agent.log
 - A same-user process that can inject into an allowed Apple binary, or repoint `SSH_AUTH_SOCK`, is out of
   scope; Touch ID / password per signature is the hardware-enforced guarantee. With a reuse window
   on, that guarantee becomes one approval per window, enforced by the agent, not the hardware.
+- Delegation trusts the relaying Mac's ssh to name the host and what it relays: the dialog shows
+  what box says, and approval on desk is the guarantee. A process on box that can reach the
+  forwarded socket can ask for approvals (and use a relay window while it is open).
 - Keys cannot be exported or backed up. One key per Mac; add each to GitHub.
 - Erasing / replacing the Secure Enclave (e.g. logic board) or deleting the blob file loses the key.

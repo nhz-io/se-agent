@@ -5,6 +5,7 @@ mod config;
 mod launchd;
 mod peer;
 mod purpose;
+mod relay;
 mod reuse;
 mod se;
 mod store;
@@ -51,7 +52,11 @@ enum Cmd {
     /// Stop and remove the LaunchAgent.
     Uninstall,
     /// Print the default socket path (for IdentityAgent / SSH_AUTH_SOCK).
-    Socket,
+    Socket {
+        /// The socket for a persistent ssh RemoteForward from another Mac instead.
+        #[arg(long)]
+        relay: bool,
+    },
     /// Show the approval reuse windows from ~/.config/se-agent/config.toml (off unless set) and
     /// the cap. After one approval, further signatures with that key from the same program don't
     /// prompt until the window ends: timeout (from the approval, not extended by use), sleep or
@@ -160,6 +165,23 @@ fn age_plugin(action: AgePluginAction) -> Result<()> {
     Ok(())
 }
 
+/// The agents the drop-in age-plugin-se asks (age::plugin_sockets).
+fn plugin_sockets() -> Result<Vec<PathBuf>> {
+    let env = std::env::var_os("SE_AGENT_UPSTREAM").map(PathBuf::from);
+    // An unreadable config.toml leaves just the other sources.
+    let config = config::load(config::cap().max)
+        .ok()
+        .and_then(|s| s.upstream);
+    let ssh = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+    Ok(age::plugin_sockets(
+        agent::default_socket()?,
+        env,
+        config,
+        ssh,
+        agent::is_forwarded_agent,
+    ))
+}
+
 fn self_test(key: &store::Key) -> Result<()> {
     use signature::Verifier;
     let msg = b"se-agent: creation self-test";
@@ -187,7 +209,7 @@ fn main() -> Result<()> {
     // Run as the drop-in age-plugin-se (a symlink of that name).
     let argv0 = std::env::args_os().next().unwrap_or_default();
     if std::path::Path::new(&argv0).file_name() == Some(age::PLUGIN_NAME.as_ref()) {
-        age::plugin_main(&agent::default_socket()?);
+        age::plugin_main(&plugin_sockets()?);
     }
     let cli = Cli::parse();
     match cli.cmd {
@@ -232,7 +254,11 @@ fn main() -> Result<()> {
             launchd::install(&socket.map_or_else(agent::default_socket, Ok)?)?
         }
         Cmd::Uninstall => launchd::uninstall()?,
-        Cmd::Socket => println!("{}", agent::default_socket()?.display()),
+        Cmd::Socket { relay } => {
+            let s = agent::default_socket()?;
+            let s = if relay { agent::relay_socket(&s) } else { s };
+            println!("{}", s.display());
+        }
         Cmd::Reuse => {
             let cap = config::cap();
             println!("cap\t{} ({})", config::fmt(cap.max), cap.source);
@@ -261,6 +287,31 @@ fn main() -> Result<()> {
                     .join(", ")
             };
             println!("age\t{a}");
+            for (host, age, w) in settings.relays() {
+                let w = w
+                    .iter()
+                    .map(|(p, d)| format!("{p} {}", config::fmt(*d)))
+                    .collect::<Vec<_>>();
+                println!(
+                    "relay {host}\tage {}, reuse {}",
+                    if age { "allowed" } else { "off" },
+                    if w.is_empty() {
+                        "off".to_string()
+                    } else {
+                        w.join(", ")
+                    }
+                );
+            }
+            if let Some(u) = &settings.upstream {
+                let state = if agent::is_forwarded_agent(u) {
+                    "forwarded agent"
+                } else if std::os::unix::net::UnixStream::connect(u).is_ok() {
+                    "reachable"
+                } else {
+                    "not reachable now"
+                };
+                println!("upstream\t{} ({state})", u.display());
+            }
             for l in settings.configured_keys() {
                 if !keys.iter().any(|k| &k.label == l) {
                     println!("warning\t[keys.{l}]: no such key");

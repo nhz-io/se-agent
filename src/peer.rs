@@ -82,6 +82,16 @@ impl Peer {
         self.trusted_apple(&SIGN_CALLERS)
     }
 
+    /// Apple's ssh, the only program that relays another Mac's requests (relay.rs).
+    pub fn may_relay(&self) -> bool {
+        self.trusted_apple(&["com.apple.ssh"])
+    }
+
+    /// The server end of a forwarded agent socket (`$SSH_AUTH_SOCK` in an ssh login): Apple's sshd.
+    pub fn is_forwarded_agent(&self) -> bool {
+        self.trusted_apple(&["com.apple.sshd-session", "com.apple.sshd"])
+    }
+
     pub fn may_list(&self) -> bool {
         self.may_sign() || self.trusted_apple(&LIST_ONLY_CALLERS)
     }

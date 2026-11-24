@@ -15,9 +15,17 @@
 //!
 //! [age]
 //! reuse = { sops = "30m" }                    # age-plugin-se keys (decryption, see age.rs)
+//!
+//! [relay.box]                             # requests another Mac relays over ssh (relay.rs)
+//! age = true                                  # may decrypt with this Mac's age keys; default no
+//! reuse = { ssh-keygen = "30m", age = "15m" } # its own windows, never the local ones
+//!
+//! [upstream]                                  # on the other Mac: where this Mac's agent is
+//! socket = "~/.ssh/agent-desk.sock"
 //! ```
 //!
-//! Programs: `ssh`, `ssh-keygen`, `scp`, `sftp`; under `[age]`: `sops`, `age`. Values: `"90s"`, `"15m"`, `"1h"` or seconds.
+//! Programs: `ssh`, `ssh-keygen`, `scp`, `sftp`; under `[age]`: `sops`, `age`; under `[relay.<host>]`:
+//! `ssh` (logins), `ssh-keygen` (SSHSIG signatures, e.g. git commits), `age`. Values: `"90s"`, `"15m"`, `"1h"` or seconds.
 //! A key's `reuse` replaces `[defaults]` entirely. Every value must be at most the cap: 1 hour,
 //! unless root-owned `/etc/se-agent/max` says otherwise (higher or lower). An entry above the cap,
 //! or naming an unknown program, is skipped and reported. A file that other users can write, or
@@ -45,6 +53,22 @@ pub const PROGRAMS: [(&str, &str); 4] = [
 
 /// Programs under `[age]`: the caller's executable name (they are not Apple-signed; see age.rs).
 pub const AGE_PROGRAMS: [(&str, &str); 2] = [("sops", "sops"), ("age", "age")];
+
+/// Programs under `[relay.<host>]`: what kind of request the other Mac relays (its programs are
+/// not visible from here). Scopes are `relay:<host>:<program>`, so they never meet local ones.
+pub const RELAY_PROGRAMS: [(&str, &str); 3] =
+    [("ssh", "ssh"), ("ssh-keygen", "ssh-keygen"), ("age", "age")];
+
+/// `[relay.<host>]` for `se-agent reuse`: (host, age allowed, windows).
+pub type RelayView<'a> = (&'a str, bool, Vec<(&'static str, Duration)>);
+
+/// `[relay.<host>]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayHost {
+    /// Relayed age decryption allowed.
+    pub age: bool,
+    reuse: Programs,
+}
 
 pub fn program_name(signing_id: &str) -> &str {
     PROGRAMS
@@ -159,6 +183,10 @@ pub struct Settings {
     keys: BTreeMap<String, Programs>,
     /// `[age]`: per program name, for every age-plugin-se key.
     age: Programs,
+    /// `[relay.<host>]`, by host name.
+    relays: BTreeMap<String, RelayHost>,
+    /// `[upstream] socket`, `~` expanded.
+    pub upstream: Option<PathBuf>,
     /// Skipped entries, for `se-agent reuse` and the agent's error log.
     pub problems: Vec<String>,
 }
@@ -194,6 +222,33 @@ impl Settings {
             .collect()
     }
 
+    /// The `[relay.<name>]` section for the first of `names` (a relayed host's names) that has one.
+    pub fn relay(&self, names: &[String]) -> Option<(&str, &RelayHost)> {
+        names
+            .iter()
+            .find_map(|n| self.relays.get_key_value(n))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// The window for a relayed request of `program` (ssh, ssh-keygen, age) from that host.
+    pub fn relay_window(&self, names: &[String], program: &str) -> Option<Duration> {
+        self.relay(names)?.1.reuse.get(program).copied()
+    }
+
+    /// `[relay.<host>]` sections, for `se-agent reuse`.
+    pub fn relays(&self) -> Vec<RelayView<'_>> {
+        self.relays
+            .iter()
+            .map(|(h, r)| {
+                let w = RELAY_PROGRAMS
+                    .iter()
+                    .filter_map(|(name, id)| r.reuse.get(*id).map(|d| (*name, *d)))
+                    .collect();
+                (h.as_str(), r.age, w)
+            })
+            .collect()
+    }
+
     pub fn configured_keys(&self) -> impl Iterator<Item = &String> {
         self.keys.keys()
     }
@@ -224,15 +279,70 @@ fn parse(text: &str, cap: Duration) -> Result<Settings> {
     let doc: toml::Table = text.parse()?;
     let mut s = Settings::default();
     for key in doc.keys() {
-        if key != "defaults" && key != "keys" && key != "age" {
+        if !["defaults", "keys", "age", "relay", "upstream"].contains(&key.as_str()) {
             s.problems.push(format!("unknown section [{key}]"));
         }
     }
     if let Some(d) = doc.get("defaults") {
-        s.defaults = programs("defaults", d, &PROGRAMS, cap, &mut s.problems)?;
+        s.defaults = programs("defaults", d, &PROGRAMS, &[], cap, &mut s.problems)?;
     }
     if let Some(a) = doc.get("age") {
-        s.age = programs("age", a, &AGE_PROGRAMS, cap, &mut s.problems)?;
+        s.age = programs("age", a, &AGE_PROGRAMS, &[], cap, &mut s.problems)?;
+    }
+    if let Some(relay) = doc.get("relay") {
+        let relay = relay
+            .as_table()
+            .context("[relay] must hold [relay.<host>] sections")?;
+        for (host, section) in relay {
+            if host.is_empty()
+                || !host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._".contains(c))
+            {
+                s.problems.push(format!("[relay.{host}]: not a host name"));
+                continue;
+            }
+            let name = format!("relay.{host}");
+            let reuse = programs(
+                &name,
+                section,
+                &RELAY_PROGRAMS,
+                &["age"],
+                cap,
+                &mut s.problems,
+            )?;
+            let age = match section.get("age") {
+                None => false,
+                Some(toml::Value::Boolean(b)) => *b,
+                Some(_) => {
+                    s.problems
+                        .push(format!("[{name}] age must be true or false; off"));
+                    false
+                }
+            };
+            s.relays
+                .insert(host.to_ascii_lowercase(), RelayHost { age, reuse });
+        }
+    }
+    if let Some(u) = doc.get("upstream") {
+        let u = u.as_table().context("[upstream] must be a table")?;
+        for k in u.keys() {
+            if k != "socket" {
+                s.problems.push(format!("[upstream]: unknown option {k:?}"));
+            }
+        }
+        match u.get("socket") {
+            None => {}
+            Some(toml::Value::String(p)) => match expand(p) {
+                Some(p) => s.upstream = Some(p),
+                None => s.problems.push(format!(
+                    "[upstream] socket = {p:?}: use an absolute path or ~/…"
+                )),
+            },
+            Some(_) => s
+                .problems
+                .push("[upstream] socket must be a path string".into()),
+        }
     }
     if let Some(keys) = doc.get("keys") {
         let keys = keys.as_table().context("[keys] must be a table")?;
@@ -245,6 +355,7 @@ fn parse(text: &str, cap: Duration) -> Result<Settings> {
                 &format!("keys.{label}"),
                 section,
                 &PROGRAMS,
+                &[],
                 cap,
                 &mut s.problems,
             )?;
@@ -254,11 +365,21 @@ fn parse(text: &str, cap: Duration) -> Result<Settings> {
     Ok(s)
 }
 
-/// One `[defaults]` / `[keys.<label>]` section → its `reuse` table.
+/// `~/x` → $HOME/x; absolute paths as they are; anything else None.
+fn expand(p: &str) -> Option<PathBuf> {
+    match p.strip_prefix("~/") {
+        Some(rest) => store::home().ok().map(|h| h.join(rest)),
+        None => Some(PathBuf::from(p)).filter(|p| p.is_absolute()),
+    }
+}
+
+/// One `[defaults]` / `[keys.<label>]` / … section → its `reuse` table. `other` are further
+/// options the section may have.
 fn programs(
     name: &str,
     section: &toml::Value,
     table: &[(&str, &'static str)],
+    other: &[&str],
     cap: Duration,
     problems: &mut Vec<String>,
 ) -> Result<Programs> {
@@ -267,7 +388,7 @@ fn programs(
         .with_context(|| format!("[{name}] must be a table"))?;
     let mut out = Programs::new();
     for k in section.keys() {
-        if k != "reuse" {
+        if k != "reuse" && !other.contains(&k.as_str()) {
             problems.push(format!("[{name}]: unknown option {k:?}"));
         }
     }
@@ -394,7 +515,72 @@ mod tests {
         assert_eq!(s.get("nhz-io", KG), Some(Duration::from_secs(7200)));
 
         assert!(parse("[keys.github]\nreuse = \"30m\"", BUILTIN_CAP).is_err());
+        assert!(s.relay(&["box".into()]).is_none());
+        assert_eq!(s.upstream, None);
         assert!(parse("not toml =", BUILTIN_CAP).is_err());
+    }
+
+    #[test]
+    fn relay_and_upstream() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let s = parse(
+            r#"
+            [age]
+            reuse = { sops = "30m" }
+
+            [relay.Box]
+            age = true
+            reuse = { ssh-keygen = "30m", age = "15m", sops = "1m", ssh = "2h" }
+
+            [relay.migi]
+            reuse = { ssh = "5m" }
+
+            [relay.bad]
+            age = "yes"
+            colour = 1
+
+            [relay."no/slash"]
+            age = true
+
+            [upstream]
+            socket = "~/.ssh/agent-desk.sock"
+            "#,
+            BUILTIN_CAP,
+        )
+        .unwrap();
+        // Section names match any of the relayed host's names, case-insensitively written.
+        let headless = names(&["box.local", "box"]);
+        let (host, r) = s.relay(&headless).unwrap();
+        assert_eq!((host, r.age), ("box", true));
+        assert_eq!(
+            s.relay_window(&headless, "ssh-keygen"),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(
+            s.relay_window(&headless, "age"),
+            Some(Duration::from_secs(900))
+        );
+        // Above the cap and unknown programs: skipped.
+        assert_eq!(s.relay_window(&headless, "ssh"), None);
+        assert_eq!(s.relay_window(&headless, "sops"), None);
+        // Age off unless `age = true`; a wrong type is off and reported.
+        assert!(!s.relay(&names(&["migi"])).unwrap().1.age);
+        assert!(!s.relay(&names(&["bad"])).unwrap().1.age);
+        assert!(s.relay(&names(&["no/slash"])).is_none());
+        assert!(s.relay(&names(&["elsewhere"])).is_none());
+        // Relay windows and local ones never mix.
+        assert_eq!(
+            s.get("age:age1se1x", "sops"),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(s.relay_window(&headless, "sops"), None);
+        assert_eq!(s.problems.len(), 5, "{:?}", s.problems);
+        assert_eq!(
+            s.upstream,
+            Some(store::home().unwrap().join(".ssh/agent-desk.sock"))
+        );
+        let s = parse("[upstream]\nsocket = \"rel/path\"", BUILTIN_CAP).unwrap();
+        assert_eq!((s.upstream, s.problems.len()), (None, 1));
     }
 
     #[test]

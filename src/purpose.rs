@@ -5,6 +5,7 @@
 //! runs in). All of it is a **hint**: a process running as you can fake its arguments or working
 //! directory. The security boundary stays the caller check and the prompt itself.
 
+use crate::relay::Relay;
 use crate::wire;
 use std::ffi::CStr;
 use std::path::Path;
@@ -101,6 +102,62 @@ pub fn describe_age(pid: i32, recipient: &str) -> Purpose {
     }
 }
 
+/// Describes a signature another Mac relays (relay.rs), and which `[relay.<host>]` program it
+/// counts as: `ssh-keygen` for SSHSIG data (e.g. git commit signing), `ssh` otherwise. `pid` is
+/// the relaying ssh on this Mac.
+pub fn describe_relayed(
+    data: &[u8],
+    pid: i32,
+    key: &str,
+    relay: &Relay,
+) -> (Purpose, &'static str) {
+    let via = via(pid, relay);
+    let key = clean(key);
+    if let Some(ns) = sshsig_namespace(data) {
+        let text = format!("sign \"{}\" data for {via} with key \"{key}\"", clean(&ns));
+        return (Purpose { text }, "ssh-keygen");
+    }
+    let text = match (userauth_user(data), &relay.destination) {
+        (Some(user), Some(dest)) => format!(
+            "log in to {} as {} for {via} with key \"{key}\"",
+            clean(dest),
+            clean(&user)
+        ),
+        (Some(user), None) => format!("log in as {} for {via} with key \"{key}\"", clean(&user)),
+        (None, _) => format!("use key \"{key}\" for {via}"),
+    };
+    (Purpose { text }, "ssh")
+}
+
+/// Describes an age decryption another Mac relays. `command` is what the drop-in plugin there
+/// reports as its caller (e.g. `sops decrypt x.yaml`): the other Mac's word for it.
+pub fn describe_age_relayed(
+    pid: i32,
+    recipient: &str,
+    relay: &Relay,
+    command: Option<&str>,
+) -> Purpose {
+    let via = via(pid, relay);
+    let key: String = recipient.chars().take(14).collect();
+    let what = command
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| format!("decrypt for \"{}\" on", clean(c)))
+        .unwrap_or_else(|| "decrypt for".into());
+    Purpose {
+        text: format!("{what} {via} with age key {key}…"),
+    }
+}
+
+/// `box (forwarded over ssh from WezTerm)`.
+fn via(pid: i32, relay: &Relay) -> String {
+    let app = ancestry(pid)
+        .iter()
+        .find_map(|p| app_name(&p.path))
+        .map(|a| format!(" from {}", clean(&a)))
+        .unwrap_or_default();
+    format!("{} (forwarded over ssh{app})", clean(&relay.host))
+}
+
 /// Characters that reorder, hide or break text: bidi marks, embeddings, overrides, isolates,
 /// line and paragraph separators, zero-width characters and the BOM.
 fn invisible(c: char) -> bool {
@@ -190,7 +247,7 @@ fn git_subcommand(args: &[String]) -> Option<String> {
 }
 
 /// ssh's argv → (destination, remote command). Options that take a value per ssh(1).
-fn ssh_destination(args: &[String]) -> (Option<String>, Option<String>) {
+pub fn ssh_destination(args: &[String]) -> (Option<String>, Option<String>) {
     const WITH_VALUE: &str = "BbcDEeFIiJLlmOoPpQRSWw";
     let mut i = 1;
     while i < args.len() {
@@ -315,7 +372,7 @@ fn pid_cwd(pid: i32) -> Option<String> {
 }
 
 /// argv via sysctl KERN_PROCARGS2: int argc, exec path, NUL padding, then argc strings.
-fn pid_args(pid: i32) -> Option<Vec<String>> {
+pub fn pid_args(pid: i32) -> Option<Vec<String>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
     let rc = unsafe {
@@ -495,6 +552,60 @@ mod tests {
             "repognp.exexy"
         );
         assert_eq!(clean(&"x".repeat(100)).chars().count(), MAX_PART);
+    }
+
+    #[test]
+    fn relayed_text() {
+        let relay = Relay {
+            host: "box".into(),
+            destination: Some("github.com".into()),
+            ..Default::default()
+        };
+        // pid 0: no process, so no app name.
+        let mut auth = Vec::new();
+        put(&mut auth, &[1u8; 32]);
+        auth.push(50);
+        for s in [&b"git"[..], b"ssh-connection", b"publickey"] {
+            put(&mut auth, s);
+        }
+        let (p, prog) = describe_relayed(&auth, 0, "github", &relay);
+        assert_eq!(
+            p.text,
+            "log in to github.com as git for box (forwarded over ssh) with key \"github\""
+        );
+        assert_eq!(prog, "ssh");
+        let mut sig = b"SSHSIG".to_vec();
+        for s in [&b"git"[..], b"", b"sha512", &[7u8; 64]] {
+            put(&mut sig, s);
+        }
+        let (p, prog) = describe_relayed(&sig, 0, "github", &relay);
+        assert_eq!(
+            p.text,
+            "sign \"git\" data for box (forwarded over ssh) with key \"github\""
+        );
+        assert_eq!(prog, "ssh-keygen");
+        let none = Relay {
+            host: "box".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_relayed(&auth, 0, "github", &none).0.text,
+            "log in as git for box (forwarded over ssh) with key \"github\""
+        );
+        assert_eq!(
+            describe_age_relayed(
+                0,
+                "age1se1qwertyuiopasdf",
+                &relay,
+                Some("sops\ndecrypt x.yaml")
+            )
+            .text,
+            "decrypt for \"sops decrypt x.yaml\" on box (forwarded over ssh) with age key age1se1qwertyu…"
+        );
+        assert_eq!(
+            describe_age_relayed(0, "age1se1qwertyuiopasdf", &relay, None).text,
+            "decrypt for box (forwarded over ssh) with age key age1se1qwertyu…"
+        );
     }
 
     #[test]
